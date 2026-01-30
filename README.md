@@ -71,10 +71,12 @@ All command-line options can be set via environment variables:
 - `HOSTS_FILE`: Path to hosts file (default: `/etc/hosts`)
 - `TLD`: Top-level domain for containers without networks (default: `.docker`)
 - `DOCKER_SOCKET`: Docker socket path (default: `unix:///var/run/docker.sock`)
+- `DEBOUNCE_MS`: Debounce delay in milliseconds before writing (default: `100`)
 
 ```bash
 export HOSTS_FILE=/tmp/hosts
 export TLD=.local
+export DEBOUNCE_MS=200
 docker-hostmanager --write
 ```
 
@@ -91,6 +93,21 @@ sudo docker-hostmanager --write
 ```
 
 The Docker image includes `--write` by default since it's running in a container.
+
+### Debouncing
+
+When multiple containers start at once (e.g., `docker-compose up`), the tool debounces writes to avoid updating the hosts file multiple times in rapid succession. By default, it waits 100ms after the last container event before writing.
+
+```bash
+# Use a longer debounce (500ms)
+docker-hostmanager --write --debounce-ms 500
+
+# Or via environment variable
+export DEBOUNCE_MS=500
+docker-hostmanager --write
+```
+
+This ensures that when a stack of containers boots up, the hosts file is only written once with all the new entries.
 
 ## How it works
 

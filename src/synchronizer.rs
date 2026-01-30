@@ -7,6 +7,9 @@ use colored::*;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration, Instant};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 
@@ -20,17 +23,21 @@ pub struct Synchronizer {
     hosts_file: PathBuf,
     tld: String,
     write_enabled: bool,
-    active_containers: HashMap<String, ContainerInfo>,
+    debounce_ms: u64,
+    active_containers: Arc<Mutex<HashMap<String, ContainerInfo>>>,
+    pending_write: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Synchronizer {
-    pub fn new(docker: Docker, hosts_file: PathBuf, tld: String, write_enabled: bool) -> Self {
+    pub fn new(docker: Docker, hosts_file: PathBuf, tld: String, write_enabled: bool, debounce_ms: u64) -> Self {
         Self {
             docker,
             hosts_file,
             tld,
             write_enabled,
-            active_containers: HashMap::new(),
+            debounce_ms,
+            active_containers: Arc::new(Mutex::new(HashMap::new())),
+            pending_write: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -48,7 +55,10 @@ impl Synchronizer {
 
         info!("Found {} running containers", containers.len());
 
-        self.active_containers.clear();
+        {
+            let mut active = self.active_containers.lock().await;
+            active.clear();
+        }
 
         for container in containers {
             let id = container.id.unwrap_or_default();
@@ -59,8 +69,9 @@ impl Synchronizer {
             match self.inspect_container(&id).await {
                 Ok(Some(info)) => {
                     if info.has_exposed_ports() {
-                        debug!("Adding container: {} ({})", info.name.bright_white(), id[..12].bright_black());
-                        self.active_containers.insert(id, info);
+                        debug!("Adding container: {} ({})", info.name, &id[..12]);
+                        let mut active = self.active_containers.lock().await;
+                        active.insert(id, info);
                     }
                 }
                 Ok(None) => {}
@@ -70,7 +81,7 @@ impl Synchronizer {
             }
         }
 
-        self.write_hosts_file()?;
+        self.write_hosts_file_immediate().await?;
         
         if !self.write_enabled {
             println!();
@@ -78,6 +89,41 @@ impl Synchronizer {
         }
         
         Ok(())
+    }
+
+    async fn schedule_write(&self) {
+        let pending = self.pending_write.clone();
+        let debounce_ms = self.debounce_ms;
+        
+        // Schedule a write
+        {
+            let mut pending_lock = pending.lock().await;
+            *pending_lock = Some(Instant::now() + Duration::from_millis(debounce_ms));
+        }
+    }
+
+    async fn process_pending_writes(&self) -> Result<()> {
+        loop {
+            sleep(Duration::from_millis(10)).await;
+            
+            let should_write = {
+                let mut pending_lock = self.pending_write.lock().await;
+                if let Some(scheduled_time) = *pending_lock {
+                    if Instant::now() >= scheduled_time {
+                        *pending_lock = None;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            
+            if should_write {
+                self.write_hosts_file_immediate().await?;
+            }
+        }
     }
 
     pub async fn listen_events(&mut self) -> Result<()> {
@@ -88,6 +134,23 @@ impl Synchronizer {
             filters,
             ..Default::default()
         }));
+
+        // Spawn background task to process pending writes
+        let sync_clone = Self {
+            docker: self.docker.clone(),
+            hosts_file: self.hosts_file.clone(),
+            tld: self.tld.clone(),
+            write_enabled: self.write_enabled,
+            debounce_ms: self.debounce_ms,
+            active_containers: self.active_containers.clone(),
+            pending_write: self.pending_write.clone(),
+        };
+        
+        tokio::spawn(async move {
+            if let Err(e) = sync_clone.process_pending_writes().await {
+                error!("Error in write processor: {}", e);
+            }
+        });
 
         while let Some(event_result) = events.next().await {
             match event_result {
@@ -135,21 +198,25 @@ impl Synchronizer {
                             info.name.bright_white(),
                             actor_id[..12].bright_black()
                         );
-                        self.active_containers.insert(actor_id.to_string(), info);
-                        self.write_hosts_file()?;
+                        let mut active = self.active_containers.lock().await;
+                        active.insert(actor_id.to_string(), info);
+                        drop(active);
+                        self.schedule_write().await;
                     }
                     _ => {}
                 }
             }
             "die" | "stop" | "kill" | "pause" | "disconnect" | "destroy" => {
-                if let Some(info) = self.active_containers.remove(actor_id) {
+                let mut active = self.active_containers.lock().await;
+                if let Some(info) = active.remove(actor_id) {
+                    drop(active);
                     println!(
                         "{} Container {} ({})",
                         "■".bright_red(),
                         info.name.bright_white(),
                         actor_id[..12].bright_black()
                     );
-                    self.write_hosts_file()?;
+                    self.schedule_write().await;
                 }
             }
             _ => {}
@@ -241,14 +308,16 @@ impl Synchronizer {
         })
     }
 
-    fn write_hosts_file(&self) -> Result<()> {
+    async fn write_hosts_file_immediate(&self) -> Result<()> {
+        let active_containers = self.active_containers.lock().await;
+        
         // Build new hosts entries
         let mut managed_lines = vec![START_TAG.to_string()];
         
         let mut container_count = 0;
         let mut hostname_count = 0;
         
-        for (_id, container) in &self.active_containers {
+        for (_id, container) in active_containers.iter() {
             let hostnames = container.get_hostnames(&self.tld);
             
             for (ip, hosts) in hostnames {
@@ -261,6 +330,8 @@ impl Synchronizer {
         }
         
         managed_lines.push(END_TAG.to_string());
+
+        drop(active_containers);
 
         // Display the output
         println!();
@@ -334,8 +405,8 @@ mod tests {
     use std::fs;
     use tempfile::NamedTempFile;
 
-    #[test]
-    fn test_write_hosts_file_creates_managed_section() {
+    #[tokio::test]
+    async fn test_write_hosts_file_creates_managed_section() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
         
@@ -343,9 +414,9 @@ mod tests {
         fs::write(&path, "127.0.0.1 localhost\n").unwrap();
 
         let docker = Docker::connect_with_socket_defaults().unwrap();
-        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true);
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
         
-        sync.write_hosts_file().unwrap();
+        sync.write_hosts_file_immediate().await.unwrap();
         
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains(START_TAG));
@@ -353,8 +424,8 @@ mod tests {
         assert!(content.contains("127.0.0.1 localhost"));
     }
 
-    #[test]
-    fn test_write_hosts_file_updates_existing_section() {
+    #[tokio::test]
+    async fn test_write_hosts_file_updates_existing_section() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
         
@@ -369,7 +440,7 @@ mod tests {
         .unwrap();
 
         let docker = Docker::connect_with_socket_defaults().unwrap();
-        let mut sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true);
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
         
         // Add a test container
         let mut networks = HashMap::new();
@@ -381,19 +452,22 @@ mod tests {
             },
         );
         
-        sync.active_containers.insert(
-            "test123".to_string(),
-            ContainerInfo {
-                id: "test123".to_string(),
-                name: "web".to_string(),
-                ip_address: None,
-                networks,
-                domain_names: vec![],
-                running: true,
-            },
-        );
+        {
+            let mut active = sync.active_containers.lock().await;
+            active.insert(
+                "test123".to_string(),
+                ContainerInfo {
+                    id: "test123".to_string(),
+                    name: "web".to_string(),
+                    ip_address: None,
+                    networks,
+                    domain_names: vec![],
+                    running: true,
+                },
+            );
+        }
         
-        sync.write_hosts_file().unwrap();
+        sync.write_hosts_file_immediate().await.unwrap();
         
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("127.0.0.1 localhost"));
@@ -402,8 +476,8 @@ mod tests {
         assert!(!content.contains("172.17.0.2 old.container"));
     }
 
-    #[test]
-    fn test_write_hosts_file_dry_run_mode() {
+    #[tokio::test]
+    async fn test_write_hosts_file_dry_run_mode() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
         
@@ -411,9 +485,9 @@ mod tests {
         fs::write(&path, "127.0.0.1 localhost\n").unwrap();
 
         let docker = Docker::connect_with_socket_defaults().unwrap();
-        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), false);
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), false, 100);
         
-        sync.write_hosts_file().unwrap();
+        sync.write_hosts_file_immediate().await.unwrap();
         
         // In dry-run mode, file should not be modified
         let content = fs::read_to_string(&path).unwrap();
@@ -425,7 +499,7 @@ mod tests {
     #[test]
     fn test_extract_container_info() {
         let docker = Docker::connect_with_socket_defaults().unwrap();
-        let sync = Synchronizer::new(docker, PathBuf::from("/tmp/hosts"), ".docker".to_string(), true);
+        let sync = Synchronizer::new(docker, PathBuf::from("/tmp/hosts"), ".docker".to_string(), true, 100);
         
         // Mock a container response
         let container = ContainerInspectResponse {
