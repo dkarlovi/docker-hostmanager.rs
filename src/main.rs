@@ -3,7 +3,6 @@ use bollard::Docker;
 use clap::Parser;
 use colored::*;
 use std::path::PathBuf;
-use tracing::{error, info};
 
 mod types;
 mod synchronizer;
@@ -33,6 +32,10 @@ struct Args {
     #[arg(short = 'w', long)]
     write: bool,
 
+    /// Debounce delay in milliseconds before writing to hosts file (allows multiple containers to start)
+    #[arg(long, env = "DEBOUNCE_MS", default_value = "100")]
+    debounce_ms: u64,
+
     /// Verbose mode
     #[arg(short, long)]
     verbose: bool,
@@ -60,42 +63,49 @@ async fn main() -> Result<()> {
     println!();
 
     // Connect to Docker
-    info!("{} {}", "Connecting to Docker at".bright_blue(), args.socket.bright_white());
+    println!("{} {}", "Connecting to Docker at".bright_blue(), args.socket.bright_white());
     let docker = Docker::connect_with_socket(&args.socket, 120, bollard::API_DEFAULT_VERSION)
         .context("Failed to connect to Docker socket")?;
 
     // Verify connection
     let version = docker.version().await.context("Failed to verify Docker connection")?;
-    info!("{} Docker {}", "✓".bright_green(), version.version.unwrap_or_default().bright_white());
+    println!("{} Docker {}", "✓".bright_green(), version.version.unwrap_or_default().bright_white());
     println!();
 
     // Create synchronizer
-    let mut sync = Synchronizer::new(docker, args.hosts_file.clone(), args.tld.clone(), args.write);
+    let mut sync = Synchronizer::new(
+        docker,
+        args.hosts_file.clone(),
+        args.tld.clone(),
+        args.write,
+        args.debounce_ms,
+    );
 
     if args.write {
         // Check if hosts file is writable
         if !args.hosts_file.exists() {
-            error!("{} Hosts file does not exist: {}", "✗".bright_red(), args.hosts_file.display());
+            eprintln!("{} Hosts file does not exist: {}", "✗".bright_red(), args.hosts_file.display());
             return Err(anyhow::anyhow!("Hosts file does not exist"));
         }
-        info!("{} Write mode enabled - will update {}", "✓".bright_green(), args.hosts_file.display());
+        println!("{} Write mode enabled - will update {}", "✓".bright_green(), args.hosts_file.display());
     } else {
-        info!("{} Dry-run mode - will only display output (use --write to update hosts file)", "ℹ".bright_blue());
+        println!("{} Dry-run mode - will only display output (use --write to update hosts file)", "ℹ".bright_blue());
     }
     println!();
 
     // Initial synchronization
-    info!("{}", "Performing initial synchronization...".bright_yellow());
+    println!("{}", "Performing initial synchronization...".bright_yellow());
     sync.synchronize().await?;
-    info!("{} {}", "✓".bright_green(), "Initial synchronization complete".bright_white());
+    println!("{} {}", "✓".bright_green(), "Initial synchronization complete".bright_white());
 
     if args.once {
-        info!("{}", "Running in once mode, exiting...".bright_yellow());
+        println!("{}", "Running in once mode, exiting...".bright_yellow());
         return Ok(());
     }
 
     // Listen for events
-    info!("{}", "Listening for Docker events...".bright_yellow());
+    println!();
+    println!("{}", "Listening for Docker events...".bright_yellow());
     sync.listen_events().await?;
 
     Ok(())
