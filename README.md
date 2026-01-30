@@ -13,6 +13,7 @@ A Rust implementation of Docker Host Manager - automatically update `/etc/hosts`
   - Custom domains via `DOMAIN_NAME` environment variable
   - Format: `DOMAIN_NAME=network:hostname` or `DOMAIN_NAME=domain1.com,domain2.com`
 - 🎨 **Nice CLI UX**: Colored output, verbose mode, clear status messages
+- 🔒 **Safe by default**: Dry-run mode (only displays output) unless `--write` flag is used
 - ⚡ **Fast**: Written in Rust for performance and reliability
 
 ## Installation
@@ -32,7 +33,8 @@ docker run -d \
   --restart=always \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /etc/hosts:/etc/hosts \
-  docker-hostmanager
+  docker-hostmanager \
+  --write
 ```
 
 ## Usage
@@ -40,23 +42,26 @@ docker run -d \
 ### Basic usage
 
 ```bash
-# Run with default settings
-sudo docker-hostmanager
+# Dry-run mode (default) - only displays output
+docker-hostmanager
+
+# Write to hosts file (requires sudo for /etc/hosts)
+sudo docker-hostmanager --write
 
 # Custom hosts file location
-sudo docker-hostmanager -f /path/to/hosts
+sudo docker-hostmanager --write -f /path/to/hosts
 
 # Custom TLD for containers without networks
-sudo docker-hostmanager -t .local
+sudo docker-hostmanager --write -t .local
 
 # Custom Docker socket
 docker-hostmanager -s unix:///custom/docker.sock
 
 # Run once and exit (no event listening)
-sudo docker-hostmanager --once
+sudo docker-hostmanager --write --once
 
 # Verbose output
-sudo docker-hostmanager -v
+docker-hostmanager -v
 ```
 
 ### Environment variables
@@ -70,8 +75,22 @@ All command-line options can be set via environment variables:
 ```bash
 export HOSTS_FILE=/tmp/hosts
 export TLD=.local
-docker-hostmanager
+docker-hostmanager --write
 ```
+
+### Dry-run mode
+
+By default, the tool runs in **dry-run mode**, which means it will only display the hosts entries it would write without actually modifying the hosts file. This is useful for testing and verification.
+
+```bash
+# See what would be written (no sudo needed)
+docker-hostmanager
+
+# Actually write to the hosts file
+sudo docker-hostmanager --write
+```
+
+The Docker image includes `--write` by default since it's running in a container.
 
 ## How it works
 
@@ -139,11 +158,12 @@ cargo build
 ### Run locally
 
 ```bash
-# Create a test hosts file
-cp /etc/hosts /tmp/hosts
+# Dry-run mode (see output without writing)
+cargo run
 
-# Run with test hosts file
-cargo run -- -f /tmp/hosts -v
+# Create a test hosts file and write to it
+cp /etc/hosts /tmp/hosts
+cargo run -- -f /tmp/hosts --write -v
 ```
 
 ### Test

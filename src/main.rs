@@ -29,6 +29,10 @@ struct Args {
     #[arg(long)]
     once: bool,
 
+    /// Write to hosts file (default is dry-run mode that only displays output)
+    #[arg(short = 'w', long)]
+    write: bool,
+
     /// Verbose mode
     #[arg(short, long)]
     verbose: bool,
@@ -48,6 +52,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(true)
         .init();
 
     println!("{}", "Docker Host Manager".bright_cyan().bold());
@@ -65,19 +70,24 @@ async fn main() -> Result<()> {
     println!();
 
     // Create synchronizer
-    let mut sync = Synchronizer::new(docker, args.hosts_file.clone(), args.tld.clone());
+    let mut sync = Synchronizer::new(docker, args.hosts_file.clone(), args.tld.clone(), args.write);
 
-    // Check if hosts file is writable
-    if !args.hosts_file.exists() {
-        error!("{} Hosts file does not exist: {}", "✗".bright_red(), args.hosts_file.display());
-        return Err(anyhow::anyhow!("Hosts file does not exist"));
+    if args.write {
+        // Check if hosts file is writable
+        if !args.hosts_file.exists() {
+            error!("{} Hosts file does not exist: {}", "✗".bright_red(), args.hosts_file.display());
+            return Err(anyhow::anyhow!("Hosts file does not exist"));
+        }
+        info!("{} Write mode enabled - will update {}", "✓".bright_green(), args.hosts_file.display());
+    } else {
+        info!("{} Dry-run mode - will only display output (use --write to update hosts file)", "ℹ".bright_blue());
     }
+    println!();
 
     // Initial synchronization
     info!("{}", "Performing initial synchronization...".bright_yellow());
     sync.synchronize().await?;
     info!("{} {}", "✓".bright_green(), "Initial synchronization complete".bright_white());
-    println!();
 
     if args.once {
         info!("{}", "Running in once mode, exiting...".bright_yellow());

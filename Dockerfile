@@ -27,3 +27,4 @@ ENV TLD=.docker
 ENV DOCKER_SOCKET=unix:///var/run/docker.sock
 
 ENTRYPOINT ["docker-hostmanager"]
+CMD ["--write"]

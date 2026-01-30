@@ -19,15 +19,17 @@ pub struct Synchronizer {
     docker: Docker,
     hosts_file: PathBuf,
     tld: String,
+    write_enabled: bool,
     active_containers: HashMap<String, ContainerInfo>,
 }
 
 impl Synchronizer {
-    pub fn new(docker: Docker, hosts_file: PathBuf, tld: String) -> Self {
+    pub fn new(docker: Docker, hosts_file: PathBuf, tld: String, write_enabled: bool) -> Self {
         Self {
             docker,
             hosts_file,
             tld,
+            write_enabled,
             active_containers: HashMap::new(),
         }
     }
@@ -69,6 +71,11 @@ impl Synchronizer {
         }
 
         self.write_hosts_file()?;
+        
+        if !self.write_enabled {
+            println!();
+            println!("{} To write to hosts file, run with --write flag", "ℹ".bright_blue());
+        }
         
         Ok(())
     }
@@ -112,8 +119,8 @@ impl Synchronizer {
 
         debug!(
             "Event: {} {} ({})",
-            action.bright_yellow(),
-            actor_id[..12].bright_black(),
+            action,
+            &actor_id[..12],
             event.typ.map(|t| format!("{:?}", t)).as_deref().unwrap_or("unknown")
         );
 
@@ -122,7 +129,7 @@ impl Synchronizer {
             "start" | "unpause" | "connect" => {
                 match self.inspect_container(actor_id).await? {
                     Some(info) if info.has_exposed_ports() => {
-                        info!(
+                        println!(
                             "{} Container {} ({})",
                             "▶".bright_green(),
                             info.name.bright_white(),
@@ -136,7 +143,7 @@ impl Synchronizer {
             }
             "die" | "stop" | "kill" | "pause" | "disconnect" | "destroy" => {
                 if let Some(info) = self.active_containers.remove(actor_id) {
-                    info!(
+                    println!(
                         "{} Container {} ({})",
                         "■".bright_red(),
                         info.name.bright_white(),
@@ -235,22 +242,6 @@ impl Synchronizer {
     }
 
     fn write_hosts_file(&self) -> Result<()> {
-        let content = fs::read_to_string(&self.hosts_file)
-            .context("Failed to read hosts file")?;
-
-        let lines: Vec<&str> = content.lines().collect();
-        
-        // Find the managed section
-        let start_idx = lines
-            .iter()
-            .position(|line| line.trim() == START_TAG)
-            .unwrap_or(lines.len());
-        
-        let end_idx = lines
-            .iter()
-            .position(|line| line.trim() == END_TAG)
-            .unwrap_or(lines.len());
-
         // Build new hosts entries
         let mut managed_lines = vec![START_TAG.to_string()];
         
@@ -271,6 +262,48 @@ impl Synchronizer {
         
         managed_lines.push(END_TAG.to_string());
 
+        // Display the output
+        println!();
+        if self.write_enabled {
+            println!("{} Hosts entries to be written:", "→".bright_cyan());
+        } else {
+            println!("{} Generated hosts entries:", "→".bright_cyan());
+        }
+        
+        for line in &managed_lines {
+            if line != START_TAG && line != END_TAG {
+                println!("  {}", line.bright_white());
+            }
+        }
+        println!();
+
+        if !self.write_enabled {
+            println!(
+                "{} {} containers, {} hostnames (dry-run mode)",
+                "ℹ".bright_blue(),
+                container_count.to_string().bright_white(),
+                hostname_count.to_string().bright_white()
+            );
+            return Ok(());
+        }
+
+        // Write mode: actually update the file
+        let content = fs::read_to_string(&self.hosts_file)
+            .context("Failed to read hosts file")?;
+
+        let lines: Vec<&str> = content.lines().collect();
+        
+        // Find the managed section
+        let start_idx = lines
+            .iter()
+            .position(|line| line.trim() == START_TAG)
+            .unwrap_or(lines.len());
+        
+        let end_idx = lines
+            .iter()
+            .position(|line| line.trim() == END_TAG)
+            .unwrap_or(lines.len());
+
         // Reconstruct the file
         let mut new_lines = Vec::new();
         new_lines.extend(lines[..start_idx].iter().map(|s| s.to_string()));
@@ -284,7 +317,7 @@ impl Synchronizer {
         fs::write(&self.hosts_file, new_content)
             .context("Failed to write hosts file")?;
 
-        info!(
+        println!(
             "{} Updated hosts file: {} containers, {} hostnames",
             "✓".bright_green(),
             container_count.to_string().bright_white(),
@@ -310,7 +343,7 @@ mod tests {
         fs::write(&path, "127.0.0.1 localhost\n").unwrap();
 
         let docker = Docker::connect_with_socket_defaults().unwrap();
-        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string());
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true);
         
         sync.write_hosts_file().unwrap();
         
@@ -336,7 +369,7 @@ mod tests {
         .unwrap();
 
         let docker = Docker::connect_with_socket_defaults().unwrap();
-        let mut sync = Synchronizer::new(docker, path.clone(), ".docker".to_string());
+        let mut sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true);
         
         // Add a test container
         let mut networks = HashMap::new();
@@ -370,9 +403,29 @@ mod tests {
     }
 
     #[test]
+    fn test_write_hosts_file_dry_run_mode() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        
+        // Write initial content
+        fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), false);
+        
+        sync.write_hosts_file().unwrap();
+        
+        // In dry-run mode, file should not be modified
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(!content.contains(START_TAG));
+        assert!(!content.contains(END_TAG));
+        assert_eq!(content, "127.0.0.1 localhost\n");
+    }
+
+    #[test]
     fn test_extract_container_info() {
         let docker = Docker::connect_with_socket_defaults().unwrap();
-        let sync = Synchronizer::new(docker, PathBuf::from("/tmp/hosts"), ".docker".to_string());
+        let sync = Synchronizer::new(docker, PathBuf::from("/tmp/hosts"), ".docker".to_string(), true);
         
         // Mock a container response
         let container = ContainerInspectResponse {
