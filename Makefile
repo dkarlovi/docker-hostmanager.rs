@@ -28,7 +28,7 @@ docker-run: docker-build ## Run in Docker container
 	docker run --rm \
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		-v /etc/hosts:/etc/hosts \
-		docker-hostmanager --write
+		dkarlovi/docker-hostmanager
 
 check: test clippy ## Run tests and linting
 	@echo "✅ All checks passed!"
