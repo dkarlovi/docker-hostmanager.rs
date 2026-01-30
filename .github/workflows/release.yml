@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    name: Build and Upload
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - build: linux-amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - build: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - build: macos-amd64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - build: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - build: windows-amd64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary (Linux and macOS)
+        if: matrix.os != 'windows-latest'
+        run: |
+          strip target/${{ matrix.target }}/release/docker-hostmanager
+
+      - name: Create archive
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          ARCHIVE="docker-hostmanager-${VERSION}-${{ matrix.build }}"
+          
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "target/${{ matrix.target }}/release/docker-hostmanager.exe" "docker-hostmanager.exe"
+            7z a "${ARCHIVE}.zip" "docker-hostmanager.exe" README.md
+            echo "ASSET=${ARCHIVE}.zip" >> $GITHUB_ENV
+          else
+            mkdir -p "${ARCHIVE}"
+            cp "target/${{ matrix.target }}/release/docker-hostmanager" "${ARCHIVE}/"
+            cp README.md "${ARCHIVE}/"
+            tar czf "${ARCHIVE}.tar.gz" "${ARCHIVE}"
+            echo "ASSET=${ARCHIVE}.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.build }}
+          path: ${{ env.ASSET }}
+
+  create-release:
+    name: Create Release
+    needs: build-and-upload
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get the previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          
+          if [ -z "$PREV_TAG" ]; then
+            CHANGELOG=$(git log --pretty=format:"* %s (%h)" --no-merges)
+          else
+            CHANGELOG=$(git log ${PREV_TAG}..HEAD --pretty=format:"* %s (%h)" --no-merges | grep -v '^* deps:' | grep -v '^* chore:' | grep -v '^* docs:' || echo "No significant changes")
+          fi
+          
+          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          body: |
+            ## Changes
+            ${{ steps.changelog.outputs.CHANGELOG }}
+            
+            ## Installation
+            
+            Download the appropriate archive for your platform and extract it.
+            
+            ### Docker
+            
+            ```bash
+            docker run -d \
+              --name docker-hostmanager \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v /etc/hosts:/etc/hosts \
+              ghcr.io/dkarlovi/docker-hostmanager:${{ github.ref_name }} \
+              --write
+            ```
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

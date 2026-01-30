@@ -18,11 +18,27 @@ A Rust implementation of Docker Host Manager - automatically update `/etc/hosts`
 
 ## Installation
 
+### From GitHub Releases
+
+Download the latest release for your platform from the [releases page](https://github.com/dkarlovi/docker-hostmanager.rs/releases):
+
+```bash
+# Linux (x86_64)
+curl -L https://github.com/dkarlovi/docker-hostmanager.rs/releases/latest/download/docker-hostmanager-VERSION-linux-amd64.tar.gz | tar xz
+sudo mv docker-hostmanager-VERSION-linux-amd64/docker-hostmanager /usr/local/bin/
+
+# macOS (Apple Silicon)
+curl -L https://github.com/dkarlovi/docker-hostmanager.rs/releases/latest/download/docker-hostmanager-VERSION-macos-arm64.tar.gz | tar xz
+sudo mv docker-hostmanager-VERSION-macos-arm64/docker-hostmanager /usr/local/bin/
+```
+
 ### From source
 
 ```bash
 cargo build --release
 sudo cp target/release/docker-hostmanager /usr/local/bin/
+# or
+make install
 ```
 
 ### Docker
@@ -33,7 +49,7 @@ docker run -d \
   --restart=always \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /etc/hosts:/etc/hosts \
-  docker-hostmanager \
+  ghcr.io/dkarlovi/docker-hostmanager:latest \
   --write
 ```
 
@@ -170,6 +186,8 @@ This will create the following hosts entries:
 
 ```bash
 cargo build
+# or
+make build
 ```
 
 ### Run locally
@@ -187,6 +205,20 @@ cargo run -- -f /tmp/hosts --write -v
 
 ```bash
 cargo test
+# or
+make test
+```
+
+### Linting
+
+```bash
+# Run Clippy
+cargo clippy --all-targets --all-features -- -D warnings
+# or
+make clippy
+
+# Run all checks (tests + clippy)
+make check
 ```
 
 ## Comparison with PHP version

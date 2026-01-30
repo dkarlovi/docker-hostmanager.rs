@@ -341,14 +341,12 @@ impl Synchronizer {
                     println!("  {}", line.bright_white());
                 }
             }
+        } else if host_entries.is_empty() {
+            println!("{} No active containers", "→".bright_cyan());
         } else {
-            if host_entries.is_empty() {
-                println!("{} No active containers", "→".bright_cyan());
-            } else {
-                println!("{} Generated hosts entries:", "→".bright_cyan());
-                for line in &host_entries {
-                    println!("  {}", line.bright_white());
-                }
+            println!("{} Generated hosts entries:", "→".bright_cyan());
+            for line in &host_entries {
+                println!("  {}", line.bright_white());
             }
         }
         println!();
