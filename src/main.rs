@@ -3,6 +3,7 @@ use bollard::Docker;
 use clap::{Parser, Subcommand};
 use colored::*;
 use std::path::PathBuf;
+use tokio::signal;
 
 mod synchronizer;
 mod types;
@@ -143,7 +144,17 @@ async fn main() -> Result<()> {
 
             println!();
             println!("{}", "Listening for Docker events...".bright_yellow());
-            sync.listen_events().await?;
+            println!("{}", "(Press Ctrl+C to stop)".bright_black());
+
+            tokio::select! {
+                result = sync.listen_events() => {
+                    result?;
+                }
+                _ = signal::ctrl_c() => {
+                    println!();
+                    println!("{}", "Received shutdown signal, exiting gracefully...".bright_yellow());
+                }
+            }
         }
         Commands::Sync { hosts_file, once } => {
             if !hosts_file.exists() {
@@ -188,7 +199,17 @@ async fn main() -> Result<()> {
 
             println!();
             println!("{}", "Listening for Docker events...".bright_yellow());
-            sync.listen_events().await?;
+            println!("{}", "(Press Ctrl+C to stop)".bright_black());
+
+            tokio::select! {
+                result = sync.listen_events() => {
+                    result?;
+                }
+                _ = signal::ctrl_c() => {
+                    println!();
+                    println!("{}", "Received shutdown signal, exiting gracefully...".bright_yellow());
+                }
+            }
         }
     }
 
