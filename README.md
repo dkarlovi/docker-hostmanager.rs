@@ -55,6 +55,18 @@ docker run -d \
 
 ## Usage
 
+### Version information
+
+```bash
+# Short version
+docker-hostmanager --version
+# Output: docker-hostmanager v1.0.0
+
+# Detailed version
+docker-hostmanager version
+# Output: dkarlovi/docker-hostmanager v1.0.0
+```
+
 ### Watch mode (default)
 
 Watch mode displays hostname changes without modifying any files. Perfect for testing and development.

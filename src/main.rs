@@ -10,8 +10,12 @@ mod types;
 
 use synchronizer::Synchronizer;
 
+// Version from git tag at build time
+const VERSION: &str = env!("GIT_VERSION");
+const PACKAGE_NAME: &str = env!("CARGO_PKG_NAME");
+
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Docker Host Manager - Automatically update /etc/hosts with container hostnames", long_about = None)]
+#[command(author, version = VERSION, about = "Docker Host Manager - Automatically update /etc/hosts with container hostnames", long_about = None)]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -63,6 +67,8 @@ enum Commands {
         #[arg(long)]
         once: bool,
     },
+    /// Show version information
+    Version,
 }
 
 #[tokio::main]
@@ -84,6 +90,7 @@ async fn main() -> Result<()> {
 
     println!("{}", "Docker Host Manager".bright_cyan().bold());
     println!("{}", "===================".bright_cyan());
+    println!("{} {}", "Version:".bright_black(), VERSION.bright_white());
     println!();
 
     // Connect to Docker
@@ -111,6 +118,10 @@ async fn main() -> Result<()> {
     let command = args.command.unwrap_or(Commands::Watch { once: false });
 
     match command {
+        Commands::Version => {
+            println!("dkarlovi/{} {}", PACKAGE_NAME, VERSION);
+            return Ok(());
+        }
         Commands::Watch { once } => {
             println!(
                 "{} Watch mode - displaying hostname changes only",

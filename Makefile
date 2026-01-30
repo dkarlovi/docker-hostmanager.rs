@@ -22,7 +22,7 @@ install: build ## Install the binary to ~/bin
 	cp target/release/docker-hostmanager ~/bin
 
 docker-build: ## Build Docker image
-	docker build -t dkarlovi/docker-hostmanager .
+	docker build -t dkarlovi/docker-hostmanager --build-arg VERSION=$$(git describe --tags --always --dirty 2>/dev/null || echo 'dev') .
 
 docker-run: docker-build ## Run in Docker container
 	docker run --rm \
