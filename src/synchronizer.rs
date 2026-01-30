@@ -311,9 +311,8 @@ impl Synchronizer {
     async fn write_hosts_file_immediate(&self) -> Result<()> {
         let active_containers = self.active_containers.lock().await;
         
-        // Build new hosts entries
-        let mut managed_lines = vec![START_TAG.to_string()];
-        
+        // Build new hosts entries (without tags initially)
+        let mut host_entries = Vec::new();
         let mut container_count = 0;
         let mut hostname_count = 0;
         
@@ -322,28 +321,34 @@ impl Synchronizer {
             
             for (ip, hosts) in hostnames {
                 if !hosts.is_empty() {
-                    managed_lines.push(format!("{} {}", ip, hosts.join(" ")));
+                    host_entries.push(format!("{} {}", ip, hosts.join(" ")));
                     hostname_count += hosts.len();
                 }
             }
             container_count += 1;
         }
         
-        managed_lines.push(END_TAG.to_string());
-
         drop(active_containers);
 
         // Display the output
         println!();
         if self.write_enabled {
-            println!("{} Hosts entries to be written:", "→".bright_cyan());
+            if host_entries.is_empty() {
+                println!("{} No active containers to write", "→".bright_cyan());
+            } else {
+                println!("{} Hosts entries to be written:", "→".bright_cyan());
+                for line in &host_entries {
+                    println!("  {}", line.bright_white());
+                }
+            }
         } else {
-            println!("{} Generated hosts entries:", "→".bright_cyan());
-        }
-        
-        for line in &managed_lines {
-            if line != START_TAG && line != END_TAG {
-                println!("  {}", line.bright_white());
+            if host_entries.is_empty() {
+                println!("{} No active containers", "→".bright_cyan());
+            } else {
+                println!("{} Generated hosts entries:", "→".bright_cyan());
+                for line in &host_entries {
+                    println!("  {}", line.bright_white());
+                }
             }
         }
         println!();
@@ -367,20 +372,46 @@ impl Synchronizer {
         // Find the managed section
         let start_idx = lines
             .iter()
-            .position(|line| line.trim() == START_TAG)
-            .unwrap_or(lines.len());
+            .position(|line| line.trim() == START_TAG);
         
         let end_idx = lines
             .iter()
-            .position(|line| line.trim() == END_TAG)
-            .unwrap_or(lines.len());
+            .position(|line| line.trim() == END_TAG);
 
-        // Reconstruct the file
         let mut new_lines = Vec::new();
-        new_lines.extend(lines[..start_idx].iter().map(|s| s.to_string()));
-        new_lines.extend(managed_lines);
-        if end_idx + 1 < lines.len() {
-            new_lines.extend(lines[end_idx + 1..].iter().map(|s| s.to_string()));
+
+        match (start_idx, end_idx) {
+            (Some(start), Some(end)) if start < end => {
+                // Managed section exists - replace it
+                new_lines.extend(lines[..start].iter().map(|s| s.to_string()));
+                
+                if !host_entries.is_empty() {
+                    // Add our managed section
+                    new_lines.push(START_TAG.to_string());
+                    new_lines.extend(host_entries);
+                    new_lines.push(END_TAG.to_string());
+                }
+                // Note: if host_entries is empty, we don't add the tags (removes empty section)
+                
+                if end + 1 < lines.len() {
+                    new_lines.extend(lines[end + 1..].iter().map(|s| s.to_string()));
+                }
+            }
+            _ => {
+                // No valid managed section - append to end
+                new_lines.extend(lines.iter().map(|s| s.to_string()));
+                
+                if !host_entries.is_empty() {
+                    // Add a blank line before our section if the file doesn't end with one
+                    if !new_lines.is_empty() && !new_lines.last().unwrap().is_empty() {
+                        new_lines.push(String::new());
+                    }
+                    
+                    new_lines.push(START_TAG.to_string());
+                    new_lines.extend(host_entries);
+                    new_lines.push(END_TAG.to_string());
+                }
+            }
         }
 
         let new_content = new_lines.join("\n") + "\n";
@@ -388,12 +419,19 @@ impl Synchronizer {
         fs::write(&self.hosts_file, new_content)
             .context("Failed to write hosts file")?;
 
-        println!(
-            "{} Updated hosts file: {} containers, {} hostnames",
-            "✓".bright_green(),
-            container_count.to_string().bright_white(),
-            hostname_count.to_string().bright_white()
-        );
+        if container_count == 0 {
+            println!(
+                "{} Removed empty managed section from hosts file",
+                "✓".bright_green()
+            );
+        } else {
+            println!(
+                "{} Updated hosts file: {} containers, {} hostnames",
+                "✓".bright_green(),
+                container_count.to_string().bright_white(),
+                hostname_count.to_string().bright_white()
+            );
+        }
 
         Ok(())
     }
@@ -416,12 +454,29 @@ mod tests {
         let docker = Docker::connect_with_socket_defaults().unwrap();
         let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
         
+        // Add a test container
+        {
+            let mut active = sync.active_containers.lock().await;
+            active.insert(
+                "test123".to_string(),
+                ContainerInfo {
+                    id: "test123".to_string(),
+                    name: "nginx".to_string(),
+                    ip_address: Some("172.17.0.2".to_string()),
+                    networks: HashMap::new(),
+                    domain_names: vec![],
+                    running: true,
+                },
+            );
+        }
+        
         sync.write_hosts_file_immediate().await.unwrap();
         
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains(START_TAG));
         assert!(content.contains(END_TAG));
         assert!(content.contains("127.0.0.1 localhost"));
+        assert!(content.contains("172.17.0.2 nginx.docker"));
     }
 
     #[tokio::test]
@@ -494,6 +549,90 @@ mod tests {
         assert!(!content.contains(START_TAG));
         assert!(!content.contains(END_TAG));
         assert_eq!(content, "127.0.0.1 localhost\n");
+    }
+
+    #[tokio::test]
+    async fn test_write_hosts_file_removes_empty_section() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        
+        // Write initial content with existing managed section
+        fs::write(
+            &path,
+            format!(
+                "127.0.0.1 localhost\n{}\n172.17.0.2 old.container\n{}\n192.168.1.1 server\n",
+                START_TAG, END_TAG
+            ),
+        )
+        .unwrap();
+
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
+        
+        // Don't add any containers - active_containers is empty
+        sync.write_hosts_file_immediate().await.unwrap();
+        
+        let content = fs::read_to_string(&path).unwrap();
+        // Should preserve other entries
+        assert!(content.contains("127.0.0.1 localhost"));
+        assert!(content.contains("192.168.1.1 server"));
+        // Should remove managed section including tags
+        assert!(!content.contains(START_TAG));
+        assert!(!content.contains(END_TAG));
+        assert!(!content.contains("172.17.0.2 old.container"));
+    }
+
+    #[tokio::test]
+    async fn test_write_hosts_file_appends_when_no_section() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        
+        // Write initial content without managed section
+        fs::write(&path, "127.0.0.1 localhost\n192.168.1.1 server\n").unwrap();
+
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
+        
+        // Add a test container
+        let mut networks = HashMap::new();
+        networks.insert(
+            "testnet".to_string(),
+            NetworkInfo {
+                ip_address: "172.18.0.2".to_string(),
+                aliases: vec!["web".to_string()],
+            },
+        );
+        
+        {
+            let mut active = sync.active_containers.lock().await;
+            active.insert(
+                "test123".to_string(),
+                ContainerInfo {
+                    id: "test123".to_string(),
+                    name: "web".to_string(),
+                    ip_address: None,
+                    networks,
+                    domain_names: vec![],
+                    running: true,
+                },
+            );
+        }
+        
+        sync.write_hosts_file_immediate().await.unwrap();
+        
+        let content = fs::read_to_string(&path).unwrap();
+        // Should preserve original entries
+        assert!(content.contains("127.0.0.1 localhost"));
+        assert!(content.contains("192.168.1.1 server"));
+        // Should append managed section
+        assert!(content.contains(START_TAG));
+        assert!(content.contains(END_TAG));
+        assert!(content.contains("172.18.0.2 web.testnet"));
+        
+        // Verify order: original entries come before managed section
+        let start_pos = content.find(START_TAG).unwrap();
+        let localhost_pos = content.find("127.0.0.1 localhost").unwrap();
+        assert!(localhost_pos < start_pos);
     }
 
     #[test]
