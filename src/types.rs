@@ -48,11 +48,17 @@ impl ContainerInfo {
             // Also support DOMAIN_NAME env var with network prefix (network:hostname format)
             for domain in &self.domain_names {
                 if let Some((net, hostname)) = domain.split_once(':') {
-                    if net == network_name {
+                    // Match if network name is exactly the same, or ends with _<net>
+                    // This allows "default:hostname" to match "project_default" network
+                    let matches = network_name == net || 
+                                 network_name.ends_with(&format!("_{}", net)) ||
+                                 network_name.ends_with(&format!("-{}", net));
+                    
+                    if matches {
                         hosts.push(hostname.to_string());
                     }
                 } else if self.ip_address.is_none() {
-                    // If no global IP, add plain domain names to first network
+                    // If no global IP, add plain domain names to all networks
                     hosts.push(domain.clone());
                 }
             }
@@ -192,6 +198,196 @@ mod tests {
         assert!(hostnames[0].1.contains(&"web.myapp".to_string()));
         assert!(hostnames[0].1.contains(&"api.local".to_string()));
         assert!(hostnames[0].1.contains(&"admin.local".to_string()));
+    }
+
+    #[test]
+    fn test_get_hostnames_with_default_network_domains() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            "urq_default".to_string(),  // Full network name from Docker
+            NetworkInfo {
+                ip_address: "172.18.0.2".to_string(),
+                aliases: vec!["urq-app".to_string()],
+            },
+        );
+
+        let container = ContainerInfo {
+            id: "abc123".to_string(),
+            name: "urq-app".to_string(),
+            ip_address: None,
+            networks,
+            domain_names: vec![
+                "default:urq.app.local".to_string(),  // Simple network name in env var
+                "default:urq.example.com".to_string(),
+            ],
+            running: true,
+        };
+
+        let hostnames = container.get_hostnames(".docker");
+        assert_eq!(hostnames.len(), 1);
+        assert_eq!(hostnames[0].0, "172.18.0.2");
+        
+        // Should contain all these hostnames
+        assert!(hostnames[0].1.contains(&"urq-app.urq_default".to_string()));
+        assert!(hostnames[0].1.contains(&"urq.app.local".to_string()));
+        assert!(hostnames[0].1.contains(&"urq.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_network_name_matching_with_underscore_suffix() {
+        // Test that "default" matches "project_default"
+        let mut networks = HashMap::new();
+        networks.insert(
+            "myproject_default".to_string(),
+            NetworkInfo {
+                ip_address: "172.20.0.5".to_string(),
+                aliases: vec!["web".to_string()],
+            },
+        );
+
+        let container = ContainerInfo {
+            id: "xyz789".to_string(),
+            name: "web".to_string(),
+            ip_address: None,
+            networks,
+            domain_names: vec!["default:api.example.com".to_string()],
+            running: true,
+        };
+
+        let hostnames = container.get_hostnames(".docker");
+        assert_eq!(hostnames.len(), 1);
+        assert!(hostnames[0].1.contains(&"api.example.com".to_string()), 
+                "Should match 'default' in env to 'myproject_default' network");
+    }
+
+    #[test]
+    fn test_network_name_matching_with_hyphen_suffix() {
+        // Test that "default" matches "project-default"
+        let mut networks = HashMap::new();
+        networks.insert(
+            "stack-default".to_string(),
+            NetworkInfo {
+                ip_address: "172.21.0.3".to_string(),
+                aliases: vec!["db".to_string()],
+            },
+        );
+
+        let container = ContainerInfo {
+            id: "def456".to_string(),
+            name: "db".to_string(),
+            ip_address: None,
+            networks,
+            domain_names: vec!["default:postgres.local".to_string()],
+            running: true,
+        };
+
+        let hostnames = container.get_hostnames(".docker");
+        assert_eq!(hostnames.len(), 1);
+        assert!(hostnames[0].1.contains(&"postgres.local".to_string()),
+                "Should match 'default' in env to 'stack-default' network");
+    }
+
+    #[test]
+    fn test_network_name_exact_match_takes_precedence() {
+        // Test that exact match works when network is actually named "default"
+        let mut networks = HashMap::new();
+        networks.insert(
+            "default".to_string(),
+            NetworkInfo {
+                ip_address: "172.22.0.2".to_string(),
+                aliases: vec!["app".to_string()],
+            },
+        );
+
+        let container = ContainerInfo {
+            id: "exact123".to_string(),
+            name: "app".to_string(),
+            ip_address: None,
+            networks,
+            domain_names: vec!["default:exact-match.test".to_string()],
+            running: true,
+        };
+
+        let hostnames = container.get_hostnames(".docker");
+        assert_eq!(hostnames.len(), 1);
+        assert!(hostnames[0].1.contains(&"exact-match.test".to_string()),
+                "Should match exact network name");
+    }
+
+    #[test]
+    fn test_network_name_no_false_positives() {
+        // Test that "default" doesn't match "mydefault" or "default_app"
+        let mut networks = HashMap::new();
+        networks.insert(
+            "mydefault".to_string(),
+            NetworkInfo {
+                ip_address: "172.23.0.2".to_string(),
+                aliases: vec!["app".to_string()],
+            },
+        );
+
+        let container = ContainerInfo {
+            id: "false123".to_string(),
+            name: "app".to_string(),
+            ip_address: None,
+            networks,
+            domain_names: vec!["default:shouldnot.match".to_string()],
+            running: true,
+        };
+
+        let hostnames = container.get_hostnames(".docker");
+        assert_eq!(hostnames.len(), 1);
+        assert!(!hostnames[0].1.contains(&"shouldnot.match".to_string()),
+                "Should NOT match 'default' to 'mydefault' (no separator)");
+    }
+
+    #[test]
+    fn test_multiple_networks_with_domain_name_matching() {
+        // Test container in multiple networks with DOMAIN_NAME targeting specific ones
+        let mut networks = HashMap::new();
+        networks.insert(
+            "frontend_default".to_string(),
+            NetworkInfo {
+                ip_address: "172.24.0.2".to_string(),
+                aliases: vec!["web".to_string()],
+            },
+        );
+        networks.insert(
+            "backend_internal".to_string(),
+            NetworkInfo {
+                ip_address: "172.25.0.2".to_string(),
+                aliases: vec!["web".to_string()],
+            },
+        );
+
+        let container = ContainerInfo {
+            id: "multi123".to_string(),
+            name: "web".to_string(),
+            ip_address: None,
+            networks,
+            domain_names: vec![
+                "default:public.example.com".to_string(),
+                "internal:private.local".to_string(),
+            ],
+            running: true,
+        };
+
+        let hostnames = container.get_hostnames(".docker");
+        assert_eq!(hostnames.len(), 2);
+        
+        // Find the frontend network entry
+        let frontend = hostnames.iter()
+            .find(|(ip, _)| ip == "172.24.0.2")
+            .expect("Should have frontend network");
+        assert!(frontend.1.contains(&"public.example.com".to_string()),
+                "Frontend should have public domain");
+        
+        // Find the backend network entry
+        let backend = hostnames.iter()
+            .find(|(ip, _)| ip == "172.25.0.2")
+            .expect("Should have backend network");
+        assert!(backend.1.contains(&"private.local".to_string()),
+                "Backend should have private domain");
     }
 
     #[test]
