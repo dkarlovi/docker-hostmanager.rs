@@ -42,7 +42,7 @@ impl ContainerInfo {
 
             // Add all aliases with network suffix
             for alias in &network_info.aliases {
-                hosts.push(format!("{}.{}", alias, network_name));
+                hosts.push(format!("{alias}.{network_name}"));
             }
 
             // Also support DOMAIN_NAME env var with network prefix (network:hostname format)
@@ -51,8 +51,8 @@ impl ContainerInfo {
                     // Match if network name is exactly the same, or ends with _<net>
                     // This allows "default:hostname" to match "project_default" network
                     let matches = network_name == net
-                        || network_name.ends_with(&format!("_{}", net))
-                        || network_name.ends_with(&format!("-{}", net));
+                        || network_name.ends_with(&format!("_{net}"))
+                        || network_name.ends_with(&format!("-{net}"));
 
                     if matches {
                         hosts.push(hostname.to_string());
@@ -73,6 +73,12 @@ impl ContainerInfo {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 

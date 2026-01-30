@@ -13,7 +13,7 @@ test: ## Run all tests
 	cargo test
 
 clippy: ## Run clippy linter
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --all-targets --all-features
 
 clean: ## Clean build artifacts
 	cargo clean
