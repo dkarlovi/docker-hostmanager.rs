@@ -46,13 +46,13 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Watch Docker events and display hostname changes (default, dry-run mode)
+    /// Watch Docker events and display hostname changes (read-only, no file modifications)
     Watch {
         /// Run once and exit (don't listen for events)
         #[arg(long)]
         once: bool,
     },
-    /// Synchronize container hostnames to hosts file
+    /// Synchronize container hostnames to hosts file (writes to file)
     Sync {
         /// Path to the hosts file to update
         #[arg(value_name = "HOSTS_FILE")]

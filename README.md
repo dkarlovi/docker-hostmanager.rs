@@ -13,7 +13,7 @@ A Rust implementation of Docker Host Manager - automatically update `/etc/hosts`
   - Custom domains via `DOMAIN_NAME` environment variable
   - Format: `DOMAIN_NAME=network:hostname` or `DOMAIN_NAME=domain1.com,domain2.com`
 - 🎨 **Nice CLI UX**: Colored output, verbose mode, clear status messages
-- 🔒 **Safe by default**: Dry-run mode (only displays output) unless `--write` flag is used
+- 🔒 **Safe by default**: Watch mode displays changes without writing to files
 - ⚡ **Fast**: Written in Rust for performance and reliability
 
 ## Installation
@@ -103,20 +103,6 @@ export TLD=.local
 export DEBOUNCE_MS=200
 docker-hostmanager sync /tmp/hosts
 ```
-
-### Dry-run mode
-
-By default, the tool runs in **watch mode**, which displays hostname changes without modifying any files. This is useful for testing and verification.
-
-```bash
-# Watch mode (no changes to files)
-docker-hostmanager
-
-# Sync mode (updates hosts file)
-sudo docker-hostmanager sync /etc/hosts
-```
-
-The Docker image uses `sync` mode by default since it's meant to manage hosts files in containers.
 
 ### Debouncing
 

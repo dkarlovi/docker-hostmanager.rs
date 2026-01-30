@@ -362,7 +362,7 @@ impl Synchronizer {
 
         if !self.write_enabled {
             println!(
-                "{} {} containers, {} hostnames (dry-run mode)",
+                "{} {} containers, {} hostnames (watch mode)",
                 "ℹ".bright_blue(),
                 container_count.to_string().bright_white(),
                 hostname_count.to_string().bright_white()
