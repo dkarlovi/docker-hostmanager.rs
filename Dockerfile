@@ -1,8 +1,16 @@
 FROM rust:1.93-alpine AS builder
+
+ARG VERSION=dev
+
 WORKDIR /usr/src/app
+
 RUN apk add --no-cache musl-dev
-COPY Cargo.toml Cargo.lock ./
+
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
+
+# Override git version detection with build arg
+ENV GIT_VERSION=${VERSION}
 RUN cargo build --release
 
 FROM alpine:3.23
