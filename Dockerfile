@@ -1,29 +1,13 @@
-FROM rust:1.93-slim AS builder
-
+FROM rust:1.93-alpine AS builder
 WORKDIR /usr/src/app
-
-# Copy manifests
+RUN apk add --no-cache musl-dev
 COPY Cargo.toml Cargo.lock ./
-
-# Copy source code
 COPY src ./src
-
-# Build release binary
 RUN cargo build --release
 
-# Runtime stage
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy binary from builder
+FROM alpine:3.23
 COPY --from=builder /usr/src/app/target/release/docker-hostmanager /usr/local/bin/
-
-# Set default environment variables
 ENV TLD=.docker
 ENV DOCKER_SOCKET=unix:///var/run/docker.sock
-
 ENTRYPOINT ["docker-hostmanager"]
 CMD ["sync", "/hosts"]
