@@ -25,7 +25,7 @@ impl ContainerInfo {
 
     pub fn get_hostnames(&self, tld: &str) -> Vec<(String, Vec<String>)> {
         let mut result = Vec::new();
-        
+
         // Global IP address with simple hostname
         if let Some(ip) = &self.ip_address {
             let mut hosts = vec![format!("{}{}", self.name, tld)];
@@ -36,10 +36,10 @@ impl ContainerInfo {
         // Network-specific IP addresses with network-qualified hostnames
         for (network_name, network_info) in &self.networks {
             let mut hosts = Vec::new();
-            
+
             // Add container name with network suffix
             hosts.push(format!("{}.{}", self.name, network_name));
-            
+
             // Add all aliases with network suffix
             for alias in &network_info.aliases {
                 hosts.push(format!("{}.{}", alias, network_name));
@@ -50,10 +50,10 @@ impl ContainerInfo {
                 if let Some((net, hostname)) = domain.split_once(':') {
                     // Match if network name is exactly the same, or ends with _<net>
                     // This allows "default:hostname" to match "project_default" network
-                    let matches = network_name == net || 
-                                 network_name.ends_with(&format!("_{}", net)) ||
-                                 network_name.ends_with(&format!("-{}", net));
-                    
+                    let matches = network_name == net
+                        || network_name.ends_with(&format!("_{}", net))
+                        || network_name.ends_with(&format!("-{}", net));
+
                     if matches {
                         hosts.push(hostname.to_string());
                     }
@@ -188,7 +188,10 @@ mod tests {
             name: "web".to_string(),
             ip_address: None,
             networks,
-            domain_names: vec!["myapp:api.local".to_string(), "myapp:admin.local".to_string()],
+            domain_names: vec![
+                "myapp:api.local".to_string(),
+                "myapp:admin.local".to_string(),
+            ],
             running: true,
         };
 
@@ -204,7 +207,7 @@ mod tests {
     fn test_get_hostnames_with_default_network_domains() {
         let mut networks = HashMap::new();
         networks.insert(
-            "urq_default".to_string(),  // Full network name from Docker
+            "urq_default".to_string(), // Full network name from Docker
             NetworkInfo {
                 ip_address: "172.18.0.2".to_string(),
                 aliases: vec!["urq-app".to_string()],
@@ -217,7 +220,7 @@ mod tests {
             ip_address: None,
             networks,
             domain_names: vec![
-                "default:urq.app.local".to_string(),  // Simple network name in env var
+                "default:urq.app.local".to_string(), // Simple network name in env var
                 "default:urq.example.com".to_string(),
             ],
             running: true,
@@ -226,7 +229,7 @@ mod tests {
         let hostnames = container.get_hostnames(".docker");
         assert_eq!(hostnames.len(), 1);
         assert_eq!(hostnames[0].0, "172.18.0.2");
-        
+
         // Should contain all these hostnames
         assert!(hostnames[0].1.contains(&"urq-app.urq_default".to_string()));
         assert!(hostnames[0].1.contains(&"urq.app.local".to_string()));
@@ -256,8 +259,10 @@ mod tests {
 
         let hostnames = container.get_hostnames(".docker");
         assert_eq!(hostnames.len(), 1);
-        assert!(hostnames[0].1.contains(&"api.example.com".to_string()), 
-                "Should match 'default' in env to 'myproject_default' network");
+        assert!(
+            hostnames[0].1.contains(&"api.example.com".to_string()),
+            "Should match 'default' in env to 'myproject_default' network"
+        );
     }
 
     #[test]
@@ -283,8 +288,10 @@ mod tests {
 
         let hostnames = container.get_hostnames(".docker");
         assert_eq!(hostnames.len(), 1);
-        assert!(hostnames[0].1.contains(&"postgres.local".to_string()),
-                "Should match 'default' in env to 'stack-default' network");
+        assert!(
+            hostnames[0].1.contains(&"postgres.local".to_string()),
+            "Should match 'default' in env to 'stack-default' network"
+        );
     }
 
     #[test]
@@ -310,8 +317,10 @@ mod tests {
 
         let hostnames = container.get_hostnames(".docker");
         assert_eq!(hostnames.len(), 1);
-        assert!(hostnames[0].1.contains(&"exact-match.test".to_string()),
-                "Should match exact network name");
+        assert!(
+            hostnames[0].1.contains(&"exact-match.test".to_string()),
+            "Should match exact network name"
+        );
     }
 
     #[test]
@@ -337,8 +346,10 @@ mod tests {
 
         let hostnames = container.get_hostnames(".docker");
         assert_eq!(hostnames.len(), 1);
-        assert!(!hostnames[0].1.contains(&"shouldnot.match".to_string()),
-                "Should NOT match 'default' to 'mydefault' (no separator)");
+        assert!(
+            !hostnames[0].1.contains(&"shouldnot.match".to_string()),
+            "Should NOT match 'default' to 'mydefault' (no separator)"
+        );
     }
 
     #[test]
@@ -374,20 +385,26 @@ mod tests {
 
         let hostnames = container.get_hostnames(".docker");
         assert_eq!(hostnames.len(), 2);
-        
+
         // Find the frontend network entry
-        let frontend = hostnames.iter()
+        let frontend = hostnames
+            .iter()
             .find(|(ip, _)| ip == "172.24.0.2")
             .expect("Should have frontend network");
-        assert!(frontend.1.contains(&"public.example.com".to_string()),
-                "Frontend should have public domain");
-        
+        assert!(
+            frontend.1.contains(&"public.example.com".to_string()),
+            "Frontend should have public domain"
+        );
+
         // Find the backend network entry
-        let backend = hostnames.iter()
+        let backend = hostnames
+            .iter()
             .find(|(ip, _)| ip == "172.25.0.2")
             .expect("Should have backend network");
-        assert!(backend.1.contains(&"private.local".to_string()),
-                "Backend should have private domain");
+        assert!(
+            backend.1.contains(&"private.local".to_string()),
+            "Backend should have private domain"
+        );
     }
 
     #[test]
@@ -419,7 +436,7 @@ mod tests {
 
         let hostnames = container.get_hostnames(".docker");
         assert_eq!(hostnames.len(), 2);
-        
+
         // Check both IPs are present
         let ips: Vec<String> = hostnames.iter().map(|(ip, _)| ip.clone()).collect();
         assert!(ips.contains(&"172.18.0.2".to_string()));

@@ -130,7 +130,7 @@ jobs:
               -v /var/run/docker.sock:/var/run/docker.sock \
               -v /etc/hosts:/etc/hosts \
               ghcr.io/dkarlovi/docker-hostmanager:${{ github.ref_name }} \
-              --write
+              sync /etc/hosts
             ```
           draft: false
           prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}

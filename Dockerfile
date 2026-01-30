@@ -22,9 +22,8 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /usr/src/app/target/release/docker-hostmanager /usr/local/bin/
 
 # Set default environment variables
-ENV HOSTS_FILE=/hosts
 ENV TLD=.docker
 ENV DOCKER_SOCKET=unix:///var/run/docker.sock
 
 ENTRYPOINT ["docker-hostmanager"]
-CMD ["--write"]
+CMD ["sync", "/hosts"]

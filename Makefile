@@ -18,11 +18,11 @@ clippy: ## Run clippy linter
 clean: ## Clean build artifacts
 	cargo clean
 
-install: build ## Install the binary to /usr/local/bin (requires sudo)
-	sudo cp target/release/docker-hostmanager /usr/local/bin/
+install: build ## Install the binary to ~/bin
+	cp target/release/docker-hostmanager ~/bin
 
 docker-build: ## Build Docker image
-	docker build -t docker-hostmanager .
+	docker build -t dkarlovi/docker-hostmanager .
 
 docker-run: docker-build ## Run in Docker container
 	docker run --rm \

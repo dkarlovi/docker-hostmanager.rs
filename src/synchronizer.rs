@@ -29,7 +29,13 @@ pub struct Synchronizer {
 }
 
 impl Synchronizer {
-    pub fn new(docker: Docker, hosts_file: PathBuf, tld: String, write_enabled: bool, debounce_ms: u64) -> Self {
+    pub fn new(
+        docker: Docker,
+        hosts_file: PathBuf,
+        tld: String,
+        write_enabled: bool,
+        debounce_ms: u64,
+    ) -> Self {
         Self {
             docker,
             hosts_file,
@@ -43,7 +49,7 @@ impl Synchronizer {
 
     pub async fn synchronize(&mut self) -> Result<()> {
         info!("Fetching running containers...");
-        
+
         let containers = self
             .docker
             .list_containers(Some(ListContainersOptions::<String> {
@@ -82,19 +88,22 @@ impl Synchronizer {
         }
 
         self.write_hosts_file_immediate().await?;
-        
+
         if !self.write_enabled {
             println!();
-            println!("{} To write to hosts file, run with --write flag", "ℹ".bright_blue());
+            println!(
+                "{} To write to hosts file, run with --write flag",
+                "ℹ".bright_blue()
+            );
         }
-        
+
         Ok(())
     }
 
     async fn schedule_write(&self) {
         let pending = self.pending_write.clone();
         let debounce_ms = self.debounce_ms;
-        
+
         // Schedule a write
         {
             let mut pending_lock = pending.lock().await;
@@ -105,7 +114,7 @@ impl Synchronizer {
     async fn process_pending_writes(&self) -> Result<()> {
         loop {
             sleep(Duration::from_millis(10)).await;
-            
+
             let should_write = {
                 let mut pending_lock = self.pending_write.lock().await;
                 if let Some(scheduled_time) = *pending_lock {
@@ -119,7 +128,7 @@ impl Synchronizer {
                     false
                 }
             };
-            
+
             if should_write {
                 self.write_hosts_file_immediate().await?;
             }
@@ -129,7 +138,7 @@ impl Synchronizer {
     pub async fn listen_events(&mut self) -> Result<()> {
         let mut filters = HashMap::new();
         filters.insert("type".to_string(), vec!["container".to_string()]);
-        
+
         let mut events = self.docker.events(Some(EventsOptions::<String> {
             filters,
             ..Default::default()
@@ -145,7 +154,7 @@ impl Synchronizer {
             active_containers: self.active_containers.clone(),
             pending_write: self.pending_write.clone(),
         };
-        
+
         tokio::spawn(async move {
             if let Err(e) = sync_clone.process_pending_writes().await {
                 error!("Error in write processor: {}", e);
@@ -184,28 +193,30 @@ impl Synchronizer {
             "Event: {} {} ({})",
             action,
             &actor_id[..12],
-            event.typ.map(|t| format!("{:?}", t)).as_deref().unwrap_or("unknown")
+            event
+                .typ
+                .map(|t| format!("{:?}", t))
+                .as_deref()
+                .unwrap_or("unknown")
         );
 
         // React to container lifecycle events
         match action {
-            "start" | "unpause" | "connect" => {
-                match self.inspect_container(actor_id).await? {
-                    Some(info) if info.has_exposed_ports() => {
-                        println!(
-                            "{} Container {} ({})",
-                            "▶".bright_green(),
-                            info.name.bright_white(),
-                            actor_id[..12].bright_black()
-                        );
-                        let mut active = self.active_containers.lock().await;
-                        active.insert(actor_id.to_string(), info);
-                        drop(active);
-                        self.schedule_write().await;
-                    }
-                    _ => {}
+            "start" | "unpause" | "connect" => match self.inspect_container(actor_id).await? {
+                Some(info) if info.has_exposed_ports() => {
+                    println!(
+                        "{} Container {} ({})",
+                        "▶".bright_green(),
+                        info.name.bright_white(),
+                        actor_id[..12].bright_black()
+                    );
+                    let mut active = self.active_containers.lock().await;
+                    active.insert(actor_id.to_string(), info);
+                    drop(active);
+                    self.schedule_write().await;
                 }
-            }
+                _ => {}
+            },
             "die" | "stop" | "kill" | "pause" | "disconnect" | "destroy" => {
                 let mut active = self.active_containers.lock().await;
                 if let Some(info) = active.remove(actor_id) {
@@ -238,12 +249,12 @@ impl Synchronizer {
     fn extract_container_info(&self, container: ContainerInspectResponse) -> Option<ContainerInfo> {
         let id = container.id?;
         let name = container.name?.trim_start_matches('/').to_string();
-        
+
         let state = container.state?;
         let running = state.running.unwrap_or(false);
 
         let network_settings = container.network_settings?;
-        
+
         // Check if container has exposed ports
         let has_ports = network_settings
             .ports
@@ -254,9 +265,7 @@ impl Synchronizer {
             return None;
         }
 
-        let ip_address = network_settings
-            .ip_address
-            .filter(|ip| !ip.is_empty());
+        let ip_address = network_settings.ip_address.filter(|ip| !ip.is_empty());
 
         let mut networks = HashMap::new();
         if let Some(nets) = network_settings.networks {
@@ -268,7 +277,7 @@ impl Synchronizer {
                         if !aliases.contains(&name) {
                             aliases.push(name.clone());
                         }
-                        
+
                         networks.insert(
                             network_name,
                             NetworkInfo {
@@ -310,15 +319,15 @@ impl Synchronizer {
 
     async fn write_hosts_file_immediate(&self) -> Result<()> {
         let active_containers = self.active_containers.lock().await;
-        
+
         // Build new hosts entries (without tags initially)
         let mut host_entries = Vec::new();
         let mut container_count = 0;
         let mut hostname_count = 0;
-        
+
         for (_id, container) in active_containers.iter() {
             let hostnames = container.get_hostnames(&self.tld);
-            
+
             for (ip, hosts) in hostnames {
                 if !hosts.is_empty() {
                     host_entries.push(format!("{} {}", ip, hosts.join(" ")));
@@ -327,7 +336,7 @@ impl Synchronizer {
             }
             container_count += 1;
         }
-        
+
         drop(active_containers);
 
         // Display the output
@@ -362,19 +371,14 @@ impl Synchronizer {
         }
 
         // Write mode: actually update the file
-        let content = fs::read_to_string(&self.hosts_file)
-            .context("Failed to read hosts file")?;
+        let content = fs::read_to_string(&self.hosts_file).context("Failed to read hosts file")?;
 
         let lines: Vec<&str> = content.lines().collect();
-        
+
         // Find the managed section
-        let start_idx = lines
-            .iter()
-            .position(|line| line.trim() == START_TAG);
-        
-        let end_idx = lines
-            .iter()
-            .position(|line| line.trim() == END_TAG);
+        let start_idx = lines.iter().position(|line| line.trim() == START_TAG);
+
+        let end_idx = lines.iter().position(|line| line.trim() == END_TAG);
 
         let mut new_lines = Vec::new();
 
@@ -382,7 +386,7 @@ impl Synchronizer {
             (Some(start), Some(end)) if start < end => {
                 // Managed section exists - replace it
                 new_lines.extend(lines[..start].iter().map(|s| s.to_string()));
-                
+
                 if !host_entries.is_empty() {
                     // Add our managed section
                     new_lines.push(START_TAG.to_string());
@@ -390,7 +394,7 @@ impl Synchronizer {
                     new_lines.push(END_TAG.to_string());
                 }
                 // Note: if host_entries is empty, we don't add the tags (removes empty section)
-                
+
                 if end + 1 < lines.len() {
                     new_lines.extend(lines[end + 1..].iter().map(|s| s.to_string()));
                 }
@@ -398,13 +402,13 @@ impl Synchronizer {
             _ => {
                 // No valid managed section - append to end
                 new_lines.extend(lines.iter().map(|s| s.to_string()));
-                
+
                 if !host_entries.is_empty() {
                     // Add a blank line before our section if the file doesn't end with one
                     if !new_lines.is_empty() && !new_lines.last().unwrap().is_empty() {
                         new_lines.push(String::new());
                     }
-                    
+
                     new_lines.push(START_TAG.to_string());
                     new_lines.extend(host_entries);
                     new_lines.push(END_TAG.to_string());
@@ -413,9 +417,8 @@ impl Synchronizer {
         }
 
         let new_content = new_lines.join("\n") + "\n";
-        
-        fs::write(&self.hosts_file, new_content)
-            .context("Failed to write hosts file")?;
+
+        fs::write(&self.hosts_file, new_content).context("Failed to write hosts file")?;
 
         if container_count == 0 {
             println!(
@@ -445,13 +448,13 @@ mod tests {
     async fn test_write_hosts_file_creates_managed_section() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
-        
+
         // Write initial content
         fs::write(&path, "127.0.0.1 localhost\n").unwrap();
 
         let docker = Docker::connect_with_socket_defaults().unwrap();
         let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
-        
+
         // Add a test container
         {
             let mut active = sync.active_containers.lock().await;
@@ -467,9 +470,9 @@ mod tests {
                 },
             );
         }
-        
+
         sync.write_hosts_file_immediate().await.unwrap();
-        
+
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains(START_TAG));
         assert!(content.contains(END_TAG));
@@ -481,7 +484,7 @@ mod tests {
     async fn test_write_hosts_file_updates_existing_section() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
-        
+
         // Write initial content with existing managed section
         fs::write(
             &path,
@@ -494,7 +497,7 @@ mod tests {
 
         let docker = Docker::connect_with_socket_defaults().unwrap();
         let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
-        
+
         // Add a test container
         let mut networks = HashMap::new();
         networks.insert(
@@ -504,7 +507,7 @@ mod tests {
                 aliases: vec!["web".to_string()],
             },
         );
-        
+
         {
             let mut active = sync.active_containers.lock().await;
             active.insert(
@@ -519,9 +522,9 @@ mod tests {
                 },
             );
         }
-        
+
         sync.write_hosts_file_immediate().await.unwrap();
-        
+
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("127.0.0.1 localhost"));
         assert!(content.contains("192.168.1.1 server"));
@@ -533,15 +536,15 @@ mod tests {
     async fn test_write_hosts_file_dry_run_mode() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
-        
+
         // Write initial content
         fs::write(&path, "127.0.0.1 localhost\n").unwrap();
 
         let docker = Docker::connect_with_socket_defaults().unwrap();
         let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), false, 100);
-        
+
         sync.write_hosts_file_immediate().await.unwrap();
-        
+
         // In dry-run mode, file should not be modified
         let content = fs::read_to_string(&path).unwrap();
         assert!(!content.contains(START_TAG));
@@ -553,7 +556,7 @@ mod tests {
     async fn test_write_hosts_file_removes_empty_section() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
-        
+
         // Write initial content with existing managed section
         fs::write(
             &path,
@@ -566,10 +569,10 @@ mod tests {
 
         let docker = Docker::connect_with_socket_defaults().unwrap();
         let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
-        
+
         // Don't add any containers - active_containers is empty
         sync.write_hosts_file_immediate().await.unwrap();
-        
+
         let content = fs::read_to_string(&path).unwrap();
         // Should preserve other entries
         assert!(content.contains("127.0.0.1 localhost"));
@@ -584,13 +587,13 @@ mod tests {
     async fn test_write_hosts_file_appends_when_no_section() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
-        
+
         // Write initial content without managed section
         fs::write(&path, "127.0.0.1 localhost\n192.168.1.1 server\n").unwrap();
 
         let docker = Docker::connect_with_socket_defaults().unwrap();
         let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
-        
+
         // Add a test container
         let mut networks = HashMap::new();
         networks.insert(
@@ -600,7 +603,7 @@ mod tests {
                 aliases: vec!["web".to_string()],
             },
         );
-        
+
         {
             let mut active = sync.active_containers.lock().await;
             active.insert(
@@ -615,9 +618,9 @@ mod tests {
                 },
             );
         }
-        
+
         sync.write_hosts_file_immediate().await.unwrap();
-        
+
         let content = fs::read_to_string(&path).unwrap();
         // Should preserve original entries
         assert!(content.contains("127.0.0.1 localhost"));
@@ -626,7 +629,7 @@ mod tests {
         assert!(content.contains(START_TAG));
         assert!(content.contains(END_TAG));
         assert!(content.contains("172.18.0.2 web.testnet"));
-        
+
         // Verify order: original entries come before managed section
         let start_pos = content.find(START_TAG).unwrap();
         let localhost_pos = content.find("127.0.0.1 localhost").unwrap();
@@ -636,8 +639,14 @@ mod tests {
     #[test]
     fn test_extract_container_info() {
         let docker = Docker::connect_with_socket_defaults().unwrap();
-        let sync = Synchronizer::new(docker, PathBuf::from("/tmp/hosts"), ".docker".to_string(), true, 100);
-        
+        let sync = Synchronizer::new(
+            docker,
+            PathBuf::from("/tmp/hosts"),
+            ".docker".to_string(),
+            true,
+            100,
+        );
+
         // Mock a container response
         let container = ContainerInspectResponse {
             id: Some("abc123".to_string()),
@@ -663,7 +672,7 @@ mod tests {
 
         let info = sync.extract_container_info(container);
         assert!(info.is_some());
-        
+
         let info = info.unwrap();
         assert_eq!(info.name, "nginx");
         assert_eq!(info.ip_address, Some("172.17.0.2".to_string()));

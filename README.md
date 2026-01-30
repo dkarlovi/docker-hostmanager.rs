@@ -50,65 +50,73 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /etc/hosts:/etc/hosts \
   ghcr.io/dkarlovi/docker-hostmanager:latest \
-  --write
+  sync /etc/hosts
 ```
 
 ## Usage
 
-### Basic usage
+### Watch mode (default)
+
+Watch mode displays hostname changes without modifying any files. Perfect for testing and development.
 
 ```bash
-# Dry-run mode (default) - only displays output
+# Watch mode (default command)
 docker-hostmanager
+# or explicitly
+docker-hostmanager watch
 
-# Write to hosts file (requires sudo for /etc/hosts)
-sudo docker-hostmanager --write
-
-# Custom hosts file location
-sudo docker-hostmanager --write -f /path/to/hosts
-
-# Custom TLD for containers without networks
-sudo docker-hostmanager --write -t .local
-
-# Custom Docker socket
-docker-hostmanager -s unix:///custom/docker.sock
-
-# Run once and exit (no event listening)
-sudo docker-hostmanager --write --once
+# Watch once and exit
+docker-hostmanager watch --once
 
 # Verbose output
-docker-hostmanager -v
+docker-hostmanager watch -v
+```
+
+### Sync mode
+
+Sync mode updates the hosts file with container hostnames. Requires a path to the hosts file.
+
+```bash
+# Sync to hosts file (requires sudo for /etc/hosts)
+sudo docker-hostmanager sync /etc/hosts
+
+# Sync once and exit
+sudo docker-hostmanager sync /etc/hosts --once
+
+# Custom TLD
+sudo docker-hostmanager sync /etc/hosts -t .local
+
+# Custom Docker socket
+docker-hostmanager sync /tmp/hosts -s unix:///custom/docker.sock
 ```
 
 ### Environment variables
 
 All command-line options can be set via environment variables:
 
-- `HOSTS_FILE`: Path to hosts file (default: `/etc/hosts`)
 - `TLD`: Top-level domain for containers without networks (default: `.docker`)
 - `DOCKER_SOCKET`: Docker socket path (default: `unix:///var/run/docker.sock`)
 - `DEBOUNCE_MS`: Debounce delay in milliseconds before writing (default: `100`)
 
 ```bash
-export HOSTS_FILE=/tmp/hosts
 export TLD=.local
 export DEBOUNCE_MS=200
-docker-hostmanager --write
+docker-hostmanager sync /tmp/hosts
 ```
 
 ### Dry-run mode
 
-By default, the tool runs in **dry-run mode**, which means it will only display the hosts entries it would write without actually modifying the hosts file. This is useful for testing and verification.
+By default, the tool runs in **watch mode**, which displays hostname changes without modifying any files. This is useful for testing and verification.
 
 ```bash
-# See what would be written (no sudo needed)
+# Watch mode (no changes to files)
 docker-hostmanager
 
-# Actually write to the hosts file
-sudo docker-hostmanager --write
+# Sync mode (updates hosts file)
+sudo docker-hostmanager sync /etc/hosts
 ```
 
-The Docker image includes `--write` by default since it's running in a container.
+The Docker image uses `sync` mode by default since it's meant to manage hosts files in containers.
 
 ### Debouncing
 
@@ -116,11 +124,11 @@ When multiple containers start at once (e.g., `docker-compose up`), the tool deb
 
 ```bash
 # Use a longer debounce (500ms)
-docker-hostmanager --write --debounce-ms 500
+docker-hostmanager sync /etc/hosts --debounce-ms 500
 
 # Or via environment variable
 export DEBOUNCE_MS=500
-docker-hostmanager --write
+docker-hostmanager sync /etc/hosts
 ```
 
 This ensures that when a stack of containers boots up, the hosts file is only written once with all the new entries.
@@ -193,12 +201,12 @@ make build
 ### Run locally
 
 ```bash
-# Dry-run mode (see output without writing)
+# Watch mode (see output without writing)
 cargo run
 
-# Create a test hosts file and write to it
+# Sync mode (write to a test hosts file)
 cp /etc/hosts /tmp/hosts
-cargo run -- -f /tmp/hosts --write -v
+cargo run -- sync /tmp/hosts -v
 ```
 
 ### Test
