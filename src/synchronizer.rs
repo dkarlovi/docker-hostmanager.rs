@@ -3,7 +3,7 @@ use bollard::container::{InspectContainerOptions, ListContainersOptions};
 use bollard::models::{ContainerInspectResponse, EventMessage};
 use bollard::system::EventsOptions;
 use bollard::Docker;
-use colored::*;
+use colored::Colorize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -47,7 +47,7 @@ impl Synchronizer {
         }
     }
 
-    pub async fn synchronize(&mut self) -> Result<()> {
+    pub async fn synchronize(&self) -> Result<()> {
         info!("Fetching running containers...");
 
         let containers = self
@@ -75,7 +75,8 @@ impl Synchronizer {
             match self.inspect_container(&id).await {
                 Ok(Some(info)) => {
                     if info.has_exposed_ports() {
-                        debug!("Adding container: {} ({})", info.name, &id[..12]);
+                        let short_id = id.get(..12).unwrap_or(&id);
+                        debug!("Adding container: {} ({})", info.name, short_id);
                         let mut active = self.active_containers.lock().await;
                         active.insert(id, info);
                     }
@@ -115,6 +116,7 @@ impl Synchronizer {
         loop {
             sleep(Duration::from_millis(10)).await;
 
+            #[allow(clippy::option_if_let_else)]
             let should_write = {
                 let mut pending_lock = self.pending_write.lock().await;
                 if let Some(scheduled_time) = *pending_lock {
@@ -135,7 +137,7 @@ impl Synchronizer {
         }
     }
 
-    pub async fn listen_events(&mut self) -> Result<()> {
+    pub async fn listen_events(&self) -> Result<()> {
         let mut filters = HashMap::new();
         filters.insert("type".to_string(), vec!["container".to_string()]);
 
@@ -177,7 +179,7 @@ impl Synchronizer {
         Ok(())
     }
 
-    async fn handle_event(&mut self, event: EventMessage) -> Result<()> {
+    async fn handle_event(&self, event: EventMessage) -> Result<()> {
         let action = event.action.as_deref().unwrap_or("");
         let actor_id = event
             .actor
@@ -189,13 +191,14 @@ impl Synchronizer {
             return Ok(());
         }
 
+        let short_actor_id = actor_id.get(..12).unwrap_or(actor_id);
         debug!(
             "Event: {} {} ({})",
             action,
-            &actor_id[..12],
+            short_actor_id,
             event
                 .typ
-                .map(|t| format!("{:?}", t))
+                .map(|t| format!("{t:?}"))
                 .as_deref()
                 .unwrap_or("unknown")
         );
@@ -204,11 +207,12 @@ impl Synchronizer {
         match action {
             "start" | "unpause" | "connect" => match self.inspect_container(actor_id).await? {
                 Some(info) if info.has_exposed_ports() => {
+                    let short_actor_id = actor_id.get(..12).unwrap_or(actor_id);
                     println!(
                         "{} Container {} ({})",
                         "▶".bright_green(),
                         info.name.bright_white(),
-                        actor_id[..12].bright_black()
+                        short_actor_id.bright_black()
                     );
                     let mut active = self.active_containers.lock().await;
                     active.insert(actor_id.to_string(), info);
@@ -221,11 +225,12 @@ impl Synchronizer {
                 let mut active = self.active_containers.lock().await;
                 if let Some(info) = active.remove(actor_id) {
                     drop(active);
+                    let short_actor_id = actor_id.get(..12).unwrap_or(actor_id);
                     println!(
                         "{} Container {} ({})",
                         "■".bright_red(),
                         info.name.bright_white(),
-                        actor_id[..12].bright_black()
+                        short_actor_id.bright_black()
                     );
                     self.schedule_write().await;
                 }
@@ -243,10 +248,10 @@ impl Synchronizer {
             .await
             .context("Failed to inspect container")?;
 
-        Ok(self.extract_container_info(container))
+        Ok(Self::extract_container_info(container))
     }
 
-    fn extract_container_info(&self, container: ContainerInspectResponse) -> Option<ContainerInfo> {
+    fn extract_container_info(container: ContainerInspectResponse) -> Option<ContainerInfo> {
         let id = container.id?;
         let name = container.name?.trim_start_matches('/').to_string();
 
@@ -256,10 +261,7 @@ impl Synchronizer {
         let network_settings = container.network_settings?;
 
         // Check if container has exposed ports
-        let has_ports = network_settings
-            .ports
-            .map(|p| !p.is_empty())
-            .unwrap_or(false);
+        let has_ports = network_settings.ports.is_some_and(|p| !p.is_empty());
 
         if !has_ports && !running {
             return None;
@@ -385,7 +387,9 @@ impl Synchronizer {
         match (start_idx, end_idx) {
             (Some(start), Some(end)) if start < end => {
                 // Managed section exists - replace it
-                new_lines.extend(lines[..start].iter().map(|s| s.to_string()));
+                if let Some(before_managed) = lines.get(..start) {
+                    new_lines.extend(before_managed.iter().map(std::string::ToString::to_string));
+                }
 
                 if !host_entries.is_empty() {
                     // Add our managed section
@@ -396,17 +400,22 @@ impl Synchronizer {
                 // Note: if host_entries is empty, we don't add the tags (removes empty section)
 
                 if end + 1 < lines.len() {
-                    new_lines.extend(lines[end + 1..].iter().map(|s| s.to_string()));
+                    if let Some(after_managed) = lines.get(end + 1..) {
+                        new_lines
+                            .extend(after_managed.iter().map(std::string::ToString::to_string));
+                    }
                 }
             }
             _ => {
                 // No valid managed section - append to end
-                new_lines.extend(lines.iter().map(|s| s.to_string()));
+                new_lines.extend(lines.iter().map(std::string::ToString::to_string));
 
                 if !host_entries.is_empty() {
                     // Add a blank line before our section if the file doesn't end with one
-                    if !new_lines.is_empty() && !new_lines.last().unwrap().is_empty() {
-                        new_lines.push(String::new());
+                    if let Some(last_line) = new_lines.last() {
+                        if !last_line.is_empty() {
+                            new_lines.push(String::new());
+                        }
                     }
 
                     new_lines.push(START_TAG.to_string());
@@ -439,6 +448,12 @@ impl Synchronizer {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use std::fs;
@@ -489,8 +504,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "127.0.0.1 localhost\n{}\n172.17.0.2 old.container\n{}\n192.168.1.1 server\n",
-                START_TAG, END_TAG
+                "127.0.0.1 localhost\n{START_TAG}\n172.17.0.2 old.container\n{END_TAG}\n192.168.1.1 server\n"
             ),
         )
         .unwrap();
@@ -561,8 +575,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "127.0.0.1 localhost\n{}\n172.17.0.2 old.container\n{}\n192.168.1.1 server\n",
-                START_TAG, END_TAG
+                "127.0.0.1 localhost\n{START_TAG}\n172.17.0.2 old.container\n{END_TAG}\n192.168.1.1 server\n"
             ),
         )
         .unwrap();
@@ -638,15 +651,6 @@ mod tests {
 
     #[test]
     fn test_extract_container_info() {
-        let docker = Docker::connect_with_socket_defaults().unwrap();
-        let sync = Synchronizer::new(
-            docker,
-            PathBuf::from("/tmp/hosts"),
-            ".docker".to_string(),
-            true,
-            100,
-        );
-
         // Mock a container response
         let container = ContainerInspectResponse {
             id: Some("abc123".to_string()),
@@ -670,13 +674,17 @@ mod tests {
             ..Default::default()
         };
 
-        let info = sync.extract_container_info(container);
+        let info = Synchronizer::extract_container_info(container);
         assert!(info.is_some());
 
-        let info = info.unwrap();
-        assert_eq!(info.name, "nginx");
-        assert_eq!(info.ip_address, Some("172.17.0.2".to_string()));
-        assert!(info.domain_names.contains(&"example.com".to_string()));
-        assert!(info.domain_names.contains(&"www.example.com".to_string()));
+        let container_info = info.unwrap();
+        assert_eq!(container_info.name, "nginx");
+        assert_eq!(container_info.ip_address, Some("172.17.0.2".to_string()));
+        assert!(container_info
+            .domain_names
+            .contains(&"example.com".to_string()));
+        assert!(container_info
+            .domain_names
+            .contains(&"www.example.com".to_string()));
     }
 }

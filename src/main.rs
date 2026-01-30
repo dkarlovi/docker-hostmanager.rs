@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bollard::Docker;
 use clap::{Parser, Subcommand};
-use colored::*;
+use colored::Colorize;
 use std::path::PathBuf;
 use tokio::signal;
 
@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
 
     match command {
         Commands::Version => {
-            println!("dkarlovi/{} {}", PACKAGE_NAME, VERSION);
+            println!("dkarlovi/{PACKAGE_NAME} {VERSION}");
             return Ok(());
         }
         Commands::Watch { once } => {
@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
             );
             println!();
 
-            let mut sync = Synchronizer::new(
+            let sync = Synchronizer::new(
                 docker,
                 PathBuf::from("/etc/hosts"), // Unused in watch mode
                 args.tld.clone(),
@@ -184,7 +184,7 @@ async fn main() -> Result<()> {
             );
             println!();
 
-            let mut sync = Synchronizer::new(
+            let sync = Synchronizer::new(
                 docker,
                 hosts_file.clone(),
                 args.tld.clone(),
