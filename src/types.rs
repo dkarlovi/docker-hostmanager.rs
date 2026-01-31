@@ -64,6 +64,9 @@ impl ContainerInfo {
             }
 
             if !hosts.is_empty() {
+                // Deduplicate hostnames while preserving order
+                let mut seen = std::collections::HashSet::new();
+                hosts.retain(|h| seen.insert(h.clone()));
                 result.push((network_info.ip_address.clone(), hosts));
             }
         }
@@ -447,5 +450,47 @@ mod tests {
         let ips: Vec<String> = hostnames.iter().map(|(ip, _)| ip.clone()).collect();
         assert!(ips.contains(&"172.18.0.2".to_string()));
         assert!(ips.contains(&"172.19.0.2".to_string()));
+    }
+
+    #[test]
+    fn test_get_hostnames_deduplicates() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            "urq_default".to_string(),
+            NetworkInfo {
+                ip_address: "172.19.0.3".to_string(),
+                aliases: vec!["urq-web-1".to_string(), "web".to_string()],
+            },
+        );
+
+        let container = ContainerInfo {
+            id: "web123".to_string(),
+            name: "urq-web-1".to_string(),
+            ip_address: None,
+            networks,
+            domain_names: vec![
+                "default:urq.app.local".to_string(),
+                "default:urq.example.com".to_string(),
+            ],
+            running: true,
+        };
+
+        let hostnames = container.get_hostnames(".docker");
+        assert_eq!(hostnames.len(), 1);
+        assert_eq!(hostnames[0].0, "172.19.0.3");
+
+        // Check that urq-web-1.urq_default appears only once
+        let hostname_list = &hostnames[0].1;
+        let count = hostname_list
+            .iter()
+            .filter(|h| *h == "urq-web-1.urq_default")
+            .count();
+        assert_eq!(count, 1, "urq-web-1.urq_default should appear exactly once");
+
+        // Verify all expected hostnames are present
+        assert!(hostname_list.contains(&"urq-web-1.urq_default".to_string()));
+        assert!(hostname_list.contains(&"web.urq_default".to_string()));
+        assert!(hostname_list.contains(&"urq.app.local".to_string()));
+        assert!(hostname_list.contains(&"urq.example.com".to_string()));
     }
 }

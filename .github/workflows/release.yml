@@ -172,14 +172,15 @@ jobs:
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
               ghcr.io/dkarlovi/docker-hostmanager.rs:${{ github.ref_name }}
             ```
+
+            Run with:
             
             ```bash
             docker run -d \
               --name docker-hostmanager \
               -v /var/run/docker.sock:/var/run/docker.sock \
-              -v /etc/hosts:/etc/hosts \
-              ghcr.io/dkarlovi/docker-hostmanager.rs:${{ github.ref_name }} \
-              sync /etc/hosts
+              -v /etc/hosts:/hosts \
+              ghcr.io/dkarlovi/docker-hostmanager.rs:${{ github.ref_name }}
             ```
           draft: false
           prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
