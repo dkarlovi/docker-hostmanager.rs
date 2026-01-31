@@ -296,6 +296,18 @@ impl Synchronizer {
                     }
                 }
             }
+
+            // Extract dev.orbstack.domains label
+            if let Some(labels) = config.labels {
+                if let Some(orbstack_domains) = labels.get("dev.orbstack.domains") {
+                    domain_names.extend(
+                        orbstack_domains
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty()),
+                    );
+                }
+            }
         }
 
         Some(ContainerInfo {
@@ -674,5 +686,84 @@ mod tests {
         assert!(container_info
             .domain_names
             .contains(&"www.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_extract_container_info_with_orbstack_label() {
+        let mut labels = HashMap::new();
+        labels.insert(
+            "dev.orbstack.domains".to_string(),
+            "foo.local,bar.local".to_string(),
+        );
+
+        let container = ContainerInspectResponse {
+            id: Some("xyz456".to_string()),
+            name: Some("/web".to_string()),
+            state: Some(bollard::models::ContainerState {
+                running: Some(true),
+                ..Default::default()
+            }),
+            config: Some(bollard::models::ContainerConfig {
+                labels: Some(labels),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                ports: Some(HashMap::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let info = Synchronizer::extract_container_info(container);
+        assert!(info.is_some());
+
+        let container_info = info.unwrap();
+        assert_eq!(container_info.name, "web");
+        assert!(container_info
+            .domain_names
+            .contains(&"foo.local".to_string()));
+        assert!(container_info
+            .domain_names
+            .contains(&"bar.local".to_string()));
+    }
+
+    #[test]
+    fn test_extract_container_info_with_both_env_and_label() {
+        let mut labels = HashMap::new();
+        labels.insert(
+            "dev.orbstack.domains".to_string(),
+            "app.example.org".to_string(),
+        );
+
+        let container = ContainerInspectResponse {
+            id: Some("multi789".to_string()),
+            name: Some("/app".to_string()),
+            state: Some(bollard::models::ContainerState {
+                running: Some(true),
+                ..Default::default()
+            }),
+            config: Some(bollard::models::ContainerConfig {
+                env: Some(vec!["DOMAIN_NAME=legacy.com".to_string()]),
+                labels: Some(labels),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                ports: Some(HashMap::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let info = Synchronizer::extract_container_info(container);
+        assert!(info.is_some());
+
+        let container_info = info.unwrap();
+        assert_eq!(container_info.name, "app");
+        assert!(container_info
+            .domain_names
+            .contains(&"legacy.com".to_string()));
+        assert!(container_info
+            .domain_names
+            .contains(&"app.example.org".to_string()));
     }
 }

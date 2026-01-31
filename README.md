@@ -11,6 +11,7 @@ A Rust implementation of Docker Host Manager - automatically update `/etc/hosts`
   - Container name + network name (e.g., `web.myapp`)
   - Network aliases
   - Custom domains via `DOMAIN_NAME` environment variable
+  - Custom domains via `dev.orbstack.domains` label (OrbStack compatible)
   - Format: `DOMAIN_NAME=network:hostname` or `DOMAIN_NAME=domain1.com,domain2.com`
 - 🎨 **Nice CLI UX**: Colored output, verbose mode, clear status messages
 - 🔒 **Safe by default**: Watch mode displays changes without writing to files
@@ -150,6 +151,10 @@ The tool generates hostnames based on container configuration:
    - Simple format: `DOMAIN_NAME=domain1.com,domain2.com`
    - Network-specific: `DOMAIN_NAME=myapp:api.local,myapp:admin.local`
 
+4. **Custom domains** via `dev.orbstack.domains` label (OrbStack compatible):
+   - Format: `dev.orbstack.domains=foo.local,bar.local`
+   - Unlike OrbStack, this implementation doesn't restrict TLDs to `.local`
+
 ### Example docker-compose.yml
 
 ```yaml
@@ -168,6 +173,8 @@ services:
           - www
     environment:
       - DOMAIN_NAME=myapp:api.local
+    labels:
+      dev.orbstack.domains: "app.example.com,www.example.com"
 
   db:
     image: postgres
@@ -181,7 +188,7 @@ This will create the following hosts entries:
 ```
 # In /etc/hosts:
 ## docker-hostmanager-start
-172.18.0.2 web.myapp www.myapp api.local
+172.18.0.2 web.myapp www.myapp api.local app.example.com www.example.com
 172.18.0.3 db.myapp database.myapp
 ## docker-hostmanager-end
 ```
