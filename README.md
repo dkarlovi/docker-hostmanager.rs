@@ -49,7 +49,7 @@ docker run -d \
   --restart=always \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /etc/hosts:/etc/hosts \
-  ghcr.io/dkarlovi/docker-hostmanager:latest \
+  ghcr.io/dkarlovi/docker-hostmanager.rs:latest \
   sync /etc/hosts
 ```
 
