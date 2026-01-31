@@ -89,14 +89,6 @@ impl Synchronizer {
 
         self.write_hosts_file_immediate().await?;
 
-        if !self.write_enabled {
-            println!();
-            println!(
-                "{} To write to hosts file, run with --write flag",
-                "ℹ".bright_blue()
-            );
-        }
-
         Ok(())
     }
 
@@ -361,7 +353,7 @@ impl Synchronizer {
 
         if !self.write_enabled {
             println!(
-                "{} {} containers, {} hostnames (watch mode)",
+                "{} {} containers, {} hostnames",
                 "ℹ".bright_blue(),
                 container_count.to_string().bright_white(),
                 hostname_count.to_string().bright_white()
