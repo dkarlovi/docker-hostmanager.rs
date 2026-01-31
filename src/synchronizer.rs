@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
-use bollard::container::{InspectContainerOptions, ListContainersOptions};
 use bollard::models::{ContainerInspectResponse, EventMessage};
-use bollard::system::EventsOptions;
+use bollard::query_parameters::{EventsOptions, InspectContainerOptions, ListContainersOptions};
 use bollard::Docker;
 use colored::Colorize;
 use std::collections::HashMap;
@@ -52,7 +51,7 @@ impl Synchronizer {
 
         let containers = self
             .docker
-            .list_containers(Some(ListContainersOptions::<String> {
+            .list_containers(Some(ListContainersOptions {
                 all: false,
                 ..Default::default()
             }))
@@ -89,14 +88,6 @@ impl Synchronizer {
         }
 
         self.write_hosts_file_immediate().await?;
-
-        if !self.write_enabled {
-            println!();
-            println!(
-                "{} To write to hosts file, run with --write flag",
-                "ℹ".bright_blue()
-            );
-        }
 
         Ok(())
     }
@@ -141,8 +132,8 @@ impl Synchronizer {
         let mut filters = HashMap::new();
         filters.insert("type".to_string(), vec!["container".to_string()]);
 
-        let mut events = self.docker.events(Some(EventsOptions::<String> {
-            filters,
+        let mut events = self.docker.events(Some(EventsOptions {
+            filters: Some(filters),
             ..Default::default()
         }));
 
@@ -267,8 +258,6 @@ impl Synchronizer {
             return None;
         }
 
-        let ip_address = network_settings.ip_address.filter(|ip| !ip.is_empty());
-
         let mut networks = HashMap::new();
         if let Some(nets) = network_settings.networks {
             for (network_name, network) in nets {
@@ -312,7 +301,7 @@ impl Synchronizer {
         Some(ContainerInfo {
             id,
             name,
-            ip_address,
+            ip_address: None,
             networks,
             domain_names,
             running,
@@ -364,7 +353,7 @@ impl Synchronizer {
 
         if !self.write_enabled {
             println!(
-                "{} {} containers, {} hostnames (watch mode)",
+                "{} {} containers, {} hostnames",
                 "ℹ".bright_blue(),
                 container_count.to_string().bright_white(),
                 hostname_count.to_string().bright_white()
@@ -667,7 +656,6 @@ mod tests {
                 ..Default::default()
             }),
             network_settings: Some(bollard::models::NetworkSettings {
-                ip_address: Some("172.17.0.2".to_string()),
                 ports: Some(HashMap::new()),
                 ..Default::default()
             }),
@@ -679,7 +667,7 @@ mod tests {
 
         let container_info = info.unwrap();
         assert_eq!(container_info.name, "nginx");
-        assert_eq!(container_info.ip_address, Some("172.17.0.2".to_string()));
+        assert_eq!(container_info.ip_address, None);
         assert!(container_info
             .domain_names
             .contains(&"example.com".to_string()));

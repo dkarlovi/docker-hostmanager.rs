@@ -10,8 +10,11 @@ keywords = ["docker", "hosts", "networking", "containers"]
 categories = ["command-line-utilities", "network-programming"]
 readme = "README.md"
 
+[profile.release]
+lto = "fat"
+
 [dependencies]
-bollard = "0.18"
+bollard = "0.20"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 clap = { version = "4", features = ["derive", "color", "env"] }
@@ -19,8 +22,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-colored = "2"
+colored = "3"
 
 [dev-dependencies]
 tempfile = "3"

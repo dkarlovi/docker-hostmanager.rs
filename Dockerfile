@@ -1,15 +1,20 @@
-FROM rust:1.93-alpine AS builder
-
-ARG VERSION=dev
-
+FROM rust:1.93-alpine AS chef
+RUN apk add --no-cache musl-dev && \
+    cargo install cargo-chef
 WORKDIR /usr/src/app
 
-RUN apk add --no-cache musl-dev
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+ARG VERSION=dev
+COPY --from=planner /usr/src/app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
-
-# Override git version detection with build arg
 ENV GIT_VERSION=${VERSION}
 RUN cargo build --release
 
