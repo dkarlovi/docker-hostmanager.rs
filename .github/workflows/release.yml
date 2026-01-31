@@ -63,11 +63,6 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Strip binary (Linux and macOS)
-        if: matrix.os != 'windows-latest'
-        run: |
-          strip target/${{ matrix.target }}/release/docker-hostmanager
-
       - name: Create archive
         shell: bash
         run: |
