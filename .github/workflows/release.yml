@@ -71,7 +71,7 @@ jobs:
       - name: Create archive
         shell: bash
         run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
           ARCHIVE="docker-hostmanager-${VERSION}-${{ matrix.build }}"
           
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
