@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::sync::{Mutex, Notify};
+use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 
@@ -24,7 +24,7 @@ pub struct Synchronizer {
     write_enabled: bool,
     debounce_ms: u64,
     active_containers: Arc<Mutex<HashMap<String, ContainerInfo>>>,
-    pending_write: Arc<Mutex<Option<Instant>>>,
+    write_notify: Notify,
 }
 
 impl Synchronizer {
@@ -42,7 +42,7 @@ impl Synchronizer {
             write_enabled,
             debounce_ms,
             active_containers: Arc::new(Mutex::new(HashMap::new())),
-            pending_write: Arc::new(Mutex::new(None)),
+            write_notify: Notify::new(),
         }
     }
 
@@ -92,38 +92,30 @@ impl Synchronizer {
         Ok(())
     }
 
-    async fn schedule_write(&self) {
-        let pending = self.pending_write.clone();
-        let debounce_ms = self.debounce_ms;
-
-        // Schedule a write
-        {
-            let mut pending_lock = pending.lock().await;
-            *pending_lock = Some(Instant::now() + Duration::from_millis(debounce_ms));
-        }
+    fn schedule_write(&self) {
+        self.write_notify.notify_one();
     }
 
     async fn process_pending_writes(&self) -> Result<()> {
         loop {
-            sleep(Duration::from_millis(10)).await;
+            // Idle until the first event signals a pending write
+            self.write_notify.notified().await;
 
-            #[allow(clippy::option_if_let_else)]
-            let should_write = {
-                let mut pending_lock = self.pending_write.lock().await;
-                if let Some(scheduled_time) = *pending_lock {
-                    if Instant::now() >= scheduled_time {
-                        *pending_lock = None;
-                        true
-                    } else {
-                        false
+            // Debounce: each new event resets the timer; write only after
+            // debounce_ms of silence
+            loop {
+                let mut notified = std::pin::pin!(self.write_notify.notified());
+                notified.as_mut().enable();
+
+                tokio::select! {
+                    () = sleep(Duration::from_millis(self.debounce_ms)) => {
+                        self.write_hosts_file_immediate().await?;
+                        break;
                     }
-                } else {
-                    false
+                    () = notified => {
+                        // New event during debounce window — loop resets the timer
+                    }
                 }
-            };
-
-            if should_write {
-                self.write_hosts_file_immediate().await?;
             }
         }
     }
@@ -137,37 +129,24 @@ impl Synchronizer {
             ..Default::default()
         }));
 
-        // Spawn background task to process pending writes
-        let sync_clone = Self {
-            docker: self.docker.clone(),
-            hosts_file: self.hosts_file.clone(),
-            tld: self.tld.clone(),
-            write_enabled: self.write_enabled,
-            debounce_ms: self.debounce_ms,
-            active_containers: self.active_containers.clone(),
-            pending_write: self.pending_write.clone(),
-        };
-
-        tokio::spawn(async move {
-            if let Err(e) = sync_clone.process_pending_writes().await {
-                error!("Error in write processor: {}", e);
-            }
-        });
-
-        while let Some(event_result) = events.next().await {
-            match event_result {
-                Ok(event) => {
-                    if let Err(e) = self.handle_event(event).await {
-                        error!("Error handling event: {}", e);
+        tokio::select! {
+            result = async {
+                while let Some(event_result) = events.next().await {
+                    match event_result {
+                        Ok(event) => {
+                            if let Err(e) = self.handle_event(event).await {
+                                error!("Error handling event: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error receiving event: {}", e);
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("Error receiving event: {}", e);
-                }
-            }
+                Ok(())
+            } => result,
+            result = self.process_pending_writes() => result,
         }
-
-        Ok(())
     }
 
     async fn handle_event(&self, event: EventMessage) -> Result<()> {
@@ -208,7 +187,7 @@ impl Synchronizer {
                     let mut active = self.active_containers.lock().await;
                     active.insert(actor_id.to_string(), info);
                     drop(active);
-                    self.schedule_write().await;
+                    self.schedule_write();
                 }
                 _ => {}
             },
@@ -223,7 +202,7 @@ impl Synchronizer {
                         info.name.bright_white(),
                         short_actor_id.bright_black()
                     );
-                    self.schedule_write().await;
+                    self.schedule_write();
                 }
             }
             _ => {}
@@ -765,5 +744,151 @@ mod tests {
         assert!(container_info
             .domain_names
             .contains(&"app.example.org".to_string()));
+    }
+
+    // ── debounce behaviour ────────────────────────────────────────────
+
+    /// Helper: insert a single container with the given name and IP into
+    /// `sync.active_containers`.
+    async fn seed_container(sync: &Synchronizer, id: &str, name: &str, ip: &str) {
+        let mut active = sync.active_containers.lock().await;
+        active.insert(
+            id.to_string(),
+            ContainerInfo {
+                id: id.to_string(),
+                name: name.to_string(),
+                ip_address: Some(ip.to_string()),
+                networks: HashMap::new(),
+                domain_names: vec![],
+                running: true,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_debounce_delays_write() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        // 100 ms debounce window
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
+        seed_container(&sync, "c1", "nginx", "172.17.0.2").await;
+
+        tokio::select! {
+            result = sync.process_pending_writes() => { result.unwrap(); }
+            () = async {
+                sync.schedule_write();
+
+                // 30 ms in — well before the 100 ms window; file untouched
+                sleep(Duration::from_millis(30)).await;
+                let content = fs::read_to_string(&path).unwrap();
+                assert!(
+                    !content.contains(START_TAG),
+                    "file written before debounce window expired"
+                );
+
+                // 150 ms in — well after the window; file written
+                sleep(Duration::from_millis(120)).await;
+                let content = fs::read_to_string(&path).unwrap();
+                assert!(
+                    content.contains("172.17.0.2 nginx.docker"),
+                    "file not written after debounce window"
+                );
+            } => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn test_debounce_resets_on_new_event() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        // 100 ms debounce window
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
+        seed_container(&sync, "c1", "nginx", "172.17.0.2").await;
+
+        tokio::select! {
+            result = sync.process_pending_writes() => { result.unwrap(); }
+            () = async {
+                // t = 0   first event
+                sync.schedule_write();
+
+                // t = 60  still inside the first 100 ms window
+                sleep(Duration::from_millis(60)).await;
+                let content = fs::read_to_string(&path).unwrap();
+                assert!(
+                    !content.contains(START_TAG),
+                    "file written before first debounce expired"
+                );
+
+                // t = 60  second event — resets window to t = 160
+                sync.schedule_write();
+
+                // t = 120 only 60 ms since the reset, still < 100 ms
+                sleep(Duration::from_millis(60)).await;
+                let content = fs::read_to_string(&path).unwrap();
+                assert!(
+                    !content.contains(START_TAG),
+                    "file written before reset debounce expired"
+                );
+
+                // t = 220 — 160 ms after the reset, well past 100 ms
+                sleep(Duration::from_millis(100)).await;
+                let content = fs::read_to_string(&path).unwrap();
+                assert!(
+                    content.contains("172.17.0.2 nginx.docker"),
+                    "file not written after reset debounce expired"
+                );
+            } => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn test_idle_after_write_no_spurious_updates() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        // 50 ms debounce — short, so the test runs fast
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 50);
+        seed_container(&sync, "a", "nginx", "172.17.0.2").await;
+
+        tokio::select! {
+            result = sync.process_pending_writes() => { result.unwrap(); }
+            () = async {
+                // Trigger and wait for the first debounced write to land
+                sync.schedule_write();
+                sleep(Duration::from_millis(100)).await;
+
+                let content = fs::read_to_string(&path).unwrap();
+                assert!(content.contains("172.17.0.2 nginx.docker"));
+
+                // Silently swap in a different container — no schedule_write
+                {
+                    let mut active = sync.active_containers.lock().await;
+                    active.clear();
+                }
+                seed_container(&sync, "b", "redis", "172.17.0.3").await;
+
+                // Wait well past a full debounce window
+                sleep(Duration::from_millis(100)).await;
+
+                // File still reflects the first write; processor was idle
+                let content = fs::read_to_string(&path).unwrap();
+                assert!(
+                    content.contains("172.17.0.2 nginx.docker"),
+                    "old entry should still be present"
+                );
+                assert!(
+                    !content.contains("172.17.0.3"),
+                    "new container written without schedule_write"
+                );
+            } => {}
+        }
     }
 }
