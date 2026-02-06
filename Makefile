@@ -9,6 +9,11 @@ help: ## Show this help message
 build: ## Build the project in release mode
 	cargo build --release
 
+build-arm64: ## Build ARM64 binary (cross-compile)
+	cargo build --release --target aarch64-unknown-linux-musl
+
+build-multiarch: build build-arm64 ## Build binaries for both amd64 and arm64
+
 test: ## Run all tests
 	cargo test
 
@@ -23,6 +28,12 @@ install: build ## Install the binary to ~/bin
 
 docker-build: ## Build Docker image
 	docker build -t dkarlovi/docker-hostmanager --build-arg VERSION=$$(git describe --tags --always --dirty 2>/dev/null || echo 'dev') .
+
+docker-build-multiarch: ## Build multi-arch Docker images (amd64 and arm64)
+	docker buildx build --platform linux/amd64,linux/arm64 -t dkarlovi/docker-hostmanager:latest --build-arg VERSION=$$(git describe --tags --always --dirty 2>/dev/null || echo 'dev') .
+
+docker-build-arm64: ## Build ARM64 Docker image
+	docker buildx build --platform linux/arm64 --load -t dkarlovi/docker-hostmanager:arm64 --build-arg VERSION=$$(git describe --tags --always --dirty 2>/dev/null || echo 'dev') .
 
 docker-run: docker-build ## Run in Docker container
 	docker run --rm \
