@@ -28,9 +28,9 @@ RUN cargo build --release --target $(cat /tmp/rust-target) && \
     mkdir -p /output && \
     cp /usr/src/app/target/$(cat /tmp/rust-target)/release/docker-hostmanager /output/docker-hostmanager
 
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=builder /output/docker-hostmanager /docker-hostmanager
+FROM gcr.io/distroless/static-debian12
+COPY --from=builder /output/docker-hostmanager /bin/docker-hostmanager
 ENV TLD=.docker
 ENV DOCKER_SOCKET=unix:///var/run/docker.sock
-ENTRYPOINT ["/docker-hostmanager"]
+ENTRYPOINT ["/bin/docker-hostmanager"]
 CMD ["sync", "/hosts"]
