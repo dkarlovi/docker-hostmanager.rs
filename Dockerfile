@@ -1,4 +1,4 @@
-FROM rust:1.93-slim AS chef
+FROM rust:1.94-slim AS chef
 RUN rustup target add x86_64-unknown-linux-musl && \
     rustup target add aarch64-unknown-linux-musl && \
     apt-get update && apt-get install -y musl-tools gcc-aarch64-linux-gnu && \
