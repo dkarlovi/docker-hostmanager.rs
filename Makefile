@@ -7,10 +7,10 @@ help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 build: ## Build the project in release mode
-	cargo build --release
+	cargo auditable build --release
 
 build-arm64: ## Build ARM64 binary (cross-compile)
-	cargo build --release --target aarch64-unknown-linux-musl
+	cargo auditable build --release --target aarch64-unknown-linux-musl
 
 build-multiarch: build build-arm64 ## Build binaries for both amd64 and arm64
 
