@@ -286,14 +286,77 @@ impl Synchronizer {
             }
         }
 
+        // Build variables map from environment variables and specific labels
+        let mut vars = HashMap::new();
+        let mut compose_project: Option<String> = None;
+
+        if let Some(config) = &container.config {
+            if let Some(env_vars) = &config.env {
+                for env_var in env_vars {
+                    if let Some((k, v)) = env_var.split_once('=') {
+                        vars.insert(k.to_string(), v.to_string());
+                    }
+                }
+            }
+            if let Some(labels) = &config.labels {
+                if let Some(proj) = labels.get("com.docker.compose.project") {
+                    compose_project = Some(proj.clone());
+                }
+            }
+        }
+
+        if !vars.contains_key("COMPOSE_PROJECT_NAME") {
+            let proj_name = compose_project
+                .unwrap_or_else(|| name.split('-').next().unwrap_or(&name).to_string());
+            vars.insert("COMPOSE_PROJECT_NAME".to_string(), proj_name);
+        }
+
+        let replace_vars = |input: &str, vars: &HashMap<String, String>| -> String {
+            let mut result = String::with_capacity(input.len());
+            let mut chars = input.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '{' {
+                    let mut var_name = String::new();
+                    let mut closed = false;
+                    while let Some(&next_c) = chars.peek() {
+                        if next_c == '}' {
+                            closed = true;
+                            chars.next(); // consume '}'
+                            break;
+                        } else if next_c == '{' {
+                            break;
+                        }
+                        var_name.push(next_c);
+                        chars.next();
+                    }
+                    if closed && !var_name.is_empty() {
+                        if let Some(val) = vars.get(&var_name) {
+                            result.push_str(val);
+                        } else {
+                            result.push('{');
+                            result.push_str(&var_name);
+                            result.push('}');
+                        }
+                    } else {
+                        result.push('{');
+                        result.push_str(&var_name);
+                    }
+                } else {
+                    result.push(c);
+                }
+            }
+            result
+        };
+
         // Extract DOMAIN_NAME environment variable
         let mut domain_names = Vec::new();
         if let Some(config) = container.config {
             if let Some(env_vars) = config.env {
                 for env in env_vars {
                     if let Some(domain_value) = env.strip_prefix("DOMAIN_NAME=") {
+                        let replaced_domain = replace_vars(domain_value, &vars);
                         domain_names.extend(
-                            domain_value
+                            replaced_domain
                                 .split(',')
                                 .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty()),
@@ -305,8 +368,9 @@ impl Synchronizer {
             // Extract dev.orbstack.domains label
             if let Some(labels) = config.labels {
                 if let Some(orbstack_domains) = labels.get("dev.orbstack.domains") {
+                    let replaced_domains = replace_vars(orbstack_domains, &vars);
                     domain_names.extend(
-                        orbstack_domains
+                        replaced_domains
                             .split(',')
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty()),
@@ -880,6 +944,111 @@ mod tests {
         assert!(container_info
             .domain_names
             .contains(&"app.example.org".to_string()));
+    }
+
+    #[test]
+    fn test_extract_container_info_with_env_template() {
+        let container = ContainerInspectResponse {
+            id: Some("envtmpl123".to_string()),
+            name: Some("/webapp".to_string()),
+            state: Some(bollard::models::ContainerState {
+                running: Some(true),
+                ..Default::default()
+            }),
+            config: Some(bollard::models::ContainerConfig {
+                env: Some(vec![
+                    "MY_VAR=custom".to_string(),
+                    "DOMAIN_NAME={MY_VAR}-app.example.com,{MISSING}-domain.local".to_string(),
+                ]),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                ports: Some(HashMap::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let info = Synchronizer::extract_container_info(container);
+        assert!(info.is_some());
+        let container_info = info.unwrap();
+
+        // Ensure successful substitution
+        assert!(container_info
+            .domain_names
+            .contains(&"custom-app.example.com".to_string()));
+        // Ensure missing variables are left unmodified
+        assert!(container_info
+            .domain_names
+            .contains(&"{MISSING}-domain.local".to_string()));
+    }
+
+    #[test]
+    fn test_extract_container_info_with_compose_template() {
+        let mut labels = HashMap::new();
+        labels.insert(
+            "com.docker.compose.project".to_string(),
+            "myproject".to_string(),
+        );
+
+        let container = ContainerInspectResponse {
+            id: Some("compose123".to_string()),
+            name: Some("/myproject-web-1".to_string()),
+            state: Some(bollard::models::ContainerState {
+                running: Some(true),
+                ..Default::default()
+            }),
+            config: Some(bollard::models::ContainerConfig {
+                env: Some(vec![
+                    "DOMAIN_NAME={COMPOSE_PROJECT_NAME}.example.com".to_string()
+                ]),
+                labels: Some(labels),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                ports: Some(HashMap::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let info = Synchronizer::extract_container_info(container);
+        assert!(info.is_some());
+        let container_info = info.unwrap();
+        assert!(container_info
+            .domain_names
+            .contains(&"myproject.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_extract_container_info_with_compose_template_fallback() {
+        let container = ContainerInspectResponse {
+            id: Some("fallback123".to_string()),
+            name: Some("/myworktree-web-1".to_string()),
+            state: Some(bollard::models::ContainerState {
+                running: Some(true),
+                ..Default::default()
+            }),
+            config: Some(bollard::models::ContainerConfig {
+                env: Some(vec![
+                    "DOMAIN_NAME={COMPOSE_PROJECT_NAME}.example.com".to_string()
+                ]),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                ports: Some(HashMap::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let info = Synchronizer::extract_container_info(container);
+        assert!(info.is_some());
+        let container_info = info.unwrap();
+        // Fallback should extract "myworktree" from "/myworktree-web-1"
+        assert!(container_info
+            .domain_names
+            .contains(&"myworktree.example.com".to_string()));
     }
 
     // ── debounce behaviour ────────────────────────────────────────────

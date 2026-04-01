@@ -13,6 +13,7 @@ A Rust implementation of Docker Host Manager - automatically update `/etc/hosts`
   - Custom domains via `DOMAIN_NAME` environment variable
   - Custom domains via `dev.orbstack.domains` label (OrbStack compatible)
   - Format: `DOMAIN_NAME=network:hostname` or `DOMAIN_NAME=domain1.com,domain2.com`
+  - **Dynamic templates**: Substitute `{COMPOSE_PROJECT_NAME}` or any container environment variable
 - 🎨 **Nice CLI UX**: Colored output, verbose mode, clear status messages
 - 🔒 **Safe by default**: Watch mode displays changes without writing to files
 - ⚡ **Fast**: Written in Rust for performance and reliability
@@ -154,6 +155,11 @@ The tool generates hostnames based on container configuration:
 4. **Custom domains** via `dev.orbstack.domains` label (OrbStack compatible):
    - Format: `dev.orbstack.domains=foo.local,bar.local`
    - Unlike OrbStack, this implementation doesn't restrict TLDs to `.local`
+
+5. **Dynamic templates**:
+   - Variables placed inside curly braces `{VARIABLE}` within `DOMAIN_NAME` or `dev.orbstack.domains` are dynamically replaced.
+   - Any container environment variable can be used (e.g., `DOMAIN_NAME={APP_ENV}.local`).
+   - `{COMPOSE_PROJECT_NAME}` automatically maps to the compose project (via the `com.docker.compose.project` label) or defaults to the generated container name prefix. This allows you to claim dedicated hostnames for multiple git worktrees. For example: `DOMAIN_NAME={COMPOSE_PROJECT_NAME}.local`.
 
 ### Example docker-compose.yml
 
