@@ -476,7 +476,10 @@ impl Synchronizer {
                 let mut skipped = Vec::new();
 
                 for h in hosts {
-                    if claims
+                    // Unresolved variables e.g. {MISSING_VAR} shouldn't be added as hostnames.
+                    if h.contains('{') && h.contains('}') {
+                        skipped.push(h);
+                    } else if claims
                         .get(&h)
                         .is_none_or(|(owner_id, _)| owner_id == container_id)
                     {
@@ -1502,6 +1505,47 @@ mod tests {
         assert!(
             content.contains("all hostnames skipped"),
             "Comment should say all hostnames were skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_hosts_file_unresolved_variables_skipped() {
+        // When a hostname contains unresolved templated variables like {MISSING},
+        // it should be put into the skipped comment rather than written as a valid hostname.
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
+
+        seed_container_claimed(
+            &sync,
+            "ccc",
+            ContainerInfo {
+                id: "ccc".to_string(),
+                name: "app".to_string(),
+                ip_address: Some("172.18.0.5".to_string()),
+                networks: HashMap::new(),
+                domain_names: vec![
+                    "{APP_SECRET_FILE}.app2.local".to_string(),
+                    "valid.local".to_string(),
+                ],
+                running: true,
+            },
+        )
+        .await;
+
+        sync.write_hosts_file_immediate().await.unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+
+        assert!(
+            content.contains("172.18.0.5 app.docker valid.local"),
+            "Valid hostnames should be written normally"
+        );
+        assert!(
+            content.contains("# skipped: {APP_SECRET_FILE}.app2.local"),
+            "Unresolved variables should be pushed to the # skipped comment"
         );
     }
 
