@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bollard::models::{ContainerInspectResponse, EventMessage};
+use bollard::models::{ContainerInspectResponse, EventActor, EventMessage, EventMessageTypeEnum};
 use bollard::query_parameters::{EventsOptions, InspectContainerOptions, ListContainersOptions};
 use bollard::Docker;
 use colored::Colorize;
@@ -146,7 +146,10 @@ impl Synchronizer {
 
     pub async fn listen_events(&self) -> Result<()> {
         let mut filters = HashMap::new();
-        filters.insert("type".to_string(), vec!["container".to_string()]);
+        filters.insert(
+            "type".to_string(),
+            vec!["container".to_string(), "network".to_string()],
+        );
 
         let mut events = self.docker.events(Some(EventsOptions {
             filters: Some(filters),
@@ -175,11 +178,9 @@ impl Synchronizer {
 
     async fn handle_event(&self, event: EventMessage) -> Result<()> {
         let action = event.action.as_deref().unwrap_or("");
-        let actor_id = event
-            .actor
-            .as_ref()
-            .and_then(|a| a.id.as_deref())
-            .unwrap_or("");
+        let event_type = event.typ;
+        let actor_ref = event.actor.as_ref();
+        let actor_id = actor_ref.and_then(|a| a.id.as_deref()).unwrap_or("");
 
         if actor_id.is_empty() {
             return Ok(());
@@ -190,51 +191,122 @@ impl Synchronizer {
             "Event: {} {} ({})",
             action,
             short_actor_id,
-            event
-                .typ
+            event_type
                 .map(|t| format!("{t:?}"))
                 .as_deref()
                 .unwrap_or("unknown")
         );
 
-        // React to container lifecycle events
-        match action {
-            "start" | "unpause" | "connect" => match self.inspect_container(actor_id).await? {
-                Some(info) if info.has_exposed_ports() => {
-                    let short_actor_id = actor_id.get(..12).unwrap_or(actor_id);
-                    println!(
-                        "{} Container {} ({})",
-                        "▶".bright_green(),
-                        info.name.bright_white(),
-                        short_actor_id.bright_black()
-                    );
-                    self.claim_hostnames(actor_id, &info).await;
-                    let mut active = self.active_containers.lock().await;
-                    active.insert(actor_id.to_string(), info);
-                    drop(active);
-                    self.schedule_write();
+        match (event_type, action) {
+            // Container lifecycle: full claim/release of all hostnames the container owns.
+            (Some(EventMessageTypeEnum::CONTAINER), "start" | "unpause") => {
+                self.handle_container_up(actor_id).await?;
+            }
+            (
+                Some(EventMessageTypeEnum::CONTAINER),
+                "die" | "stop" | "kill" | "pause" | "destroy",
+            ) => {
+                self.handle_container_down(actor_id).await;
+            }
+            // Network events: actor.id is the network ID; the affected container ID
+            // lives in attributes. Only the hostnames bound to the specific network
+            // should be touched — never the container's claims on other networks.
+            (Some(EventMessageTypeEnum::NETWORK), "connect") => {
+                if let Some((container_id, _network_name)) = Self::network_event_targets(actor_ref)
+                {
+                    self.handle_container_up(&container_id).await?;
                 }
-                _ => {}
-            },
-            "die" | "stop" | "kill" | "pause" | "disconnect" | "destroy" => {
-                let mut active = self.active_containers.lock().await;
-                if let Some(info) = active.remove(actor_id) {
-                    drop(active);
-                    self.release_hostnames(actor_id, &info).await;
-                    let short_actor_id = actor_id.get(..12).unwrap_or(actor_id);
-                    println!(
-                        "{} Container {} ({})",
-                        "■".bright_red(),
-                        info.name.bright_white(),
-                        short_actor_id.bright_black()
-                    );
-                    self.schedule_write();
+            }
+            (Some(EventMessageTypeEnum::NETWORK), "disconnect") => {
+                if let Some((container_id, network_name)) = Self::network_event_targets(actor_ref) {
+                    self.handle_network_disconnect(&container_id, &network_name)
+                        .await;
                 }
             }
             _ => {}
         }
 
         Ok(())
+    }
+
+    async fn handle_container_up(&self, container_id: &str) -> Result<()> {
+        if let Some(info) = self.inspect_container(container_id).await? {
+            if !info.has_exposed_ports() {
+                return Ok(());
+            }
+            let short_actor_id = container_id.get(..12).unwrap_or(container_id);
+            println!(
+                "{} Container {} ({})",
+                "▶".bright_green(),
+                info.name.bright_white(),
+                short_actor_id.bright_black()
+            );
+            self.claim_hostnames(container_id, &info).await;
+            let mut active = self.active_containers.lock().await;
+            active.insert(container_id.to_string(), info);
+            drop(active);
+            self.schedule_write();
+        }
+        Ok(())
+    }
+
+    async fn handle_container_down(&self, container_id: &str) {
+        let mut active = self.active_containers.lock().await;
+        if let Some(info) = active.remove(container_id) {
+            drop(active);
+            self.release_hostnames(container_id, &info, None).await;
+            let short_actor_id = container_id.get(..12).unwrap_or(container_id);
+            println!(
+                "{} Container {} ({})",
+                "■".bright_red(),
+                info.name.bright_white(),
+                short_actor_id.bright_black()
+            );
+            self.schedule_write();
+        }
+    }
+
+    /// Handles a network `disconnect` event: drops only the claims bound to the
+    /// specific network the container left, and refreshes the active state to
+    /// reflect the new network attachment set. The container itself stays running,
+    /// so claims on its other networks must be preserved.
+    async fn handle_network_disconnect(&self, container_id: &str, network_name: &str) {
+        // Read the snapshot we hold for this container; if we don't know about it,
+        // there's nothing to release.
+        let snapshot = {
+            let active = self.active_containers.lock().await;
+            active.get(container_id).cloned()
+        };
+        let Some(info) = snapshot else { return };
+
+        self.release_hostnames(container_id, &info, Some(network_name))
+            .await;
+
+        // Refresh container state from Docker so subsequent reconnects see the
+        // current network set. If the container is gone or no longer exposes
+        // anything, treat as a full down event.
+        match self.inspect_container(container_id).await {
+            Ok(Some(refreshed)) if refreshed.has_exposed_ports() => {
+                let mut active = self.active_containers.lock().await;
+                active.insert(container_id.to_string(), refreshed);
+            }
+            _ => {
+                let mut active = self.active_containers.lock().await;
+                active.remove(container_id);
+            }
+        }
+
+        self.schedule_write();
+    }
+
+    fn network_event_targets(actor: Option<&EventActor>) -> Option<(String, String)> {
+        let attrs = actor?.attributes.as_ref()?;
+        let container_id = attrs.get("container")?.clone();
+        let network_name = attrs.get("name")?.clone();
+        if container_id.is_empty() || network_name.is_empty() {
+            return None;
+        }
+        Some((container_id, network_name))
     }
 
     async fn inspect_container(&self, id: &str) -> Result<Option<ContainerInfo>> {
@@ -419,11 +491,28 @@ impl Synchronizer {
         }
     }
 
-    /// Releases all hostname claims held by `container_id`.
-    async fn release_hostnames(&self, container_id: &str, container: &ContainerInfo) {
+    /// Releases hostname claims held by `container_id`. When `only_network` is
+    /// `Some(name)`, only hostnames bound to that specific network attachment are
+    /// released — claims tied to the container's other networks are preserved.
+    /// When `None`, all of the container's hostnames are released (used for full
+    /// container teardown: die/stop/kill/pause/destroy).
+    async fn release_hostnames(
+        &self,
+        container_id: &str,
+        container: &ContainerInfo,
+        only_network: Option<&str>,
+    ) {
+        let only_network_ip =
+            only_network.and_then(|net| container.networks.get(net).map(|n| n.ip_address.as_str()));
+
+        // When filtering to a specific network, keep only the entry whose IP
+        // matches that network's IP. The global-ip entry (used when the container
+        // has no per-network IP) is intentionally skipped — it isn't bound to any
+        // one network, so a network disconnect shouldn't drop it.
         let all_hostnames: Vec<String> = container
             .get_hostnames(&self.tld)
             .into_iter()
+            .filter(|(ip, _)| only_network_ip.is_none_or(|net_ip| ip == net_ip))
             .flat_map(|(_, hosts)| hosts)
             .collect();
 
@@ -1346,7 +1435,7 @@ mod tests {
         seed_container_claimed(&sync, "aaa", container_a.clone()).await;
 
         // A stops — release its hostnames then remove from active
-        sync.release_hostnames("aaa", &container_a).await;
+        sync.release_hostnames("aaa", &container_a, None).await;
         {
             let mut active = sync.active_containers.lock().await;
             active.remove("aaa");
@@ -1632,5 +1721,216 @@ mod tests {
             ips_found, expected_order,
             "IP strings should appear in sorted order"
         );
+    }
+
+    // ── partial release on network disconnect ─────────────────────────────
+
+    /// Builds a `ContainerInfo` resembling the urq dev setup: a `web` container
+    /// attached to a project-private `*_default` network (where it owns the
+    /// project's local dev domain via a `default:hostname` env entry) and to a
+    /// shared `public` network (used by an external proxy / tunnel).
+    fn multi_network_web(
+        id: &str,
+        name: &str,
+        default_net: &str,
+        default_ip: &str,
+        public_ip: &str,
+        dev_domain: &str,
+    ) -> ContainerInfo {
+        let mut networks = HashMap::new();
+        networks.insert(
+            default_net.to_string(),
+            NetworkInfo {
+                ip_address: default_ip.to_string(),
+                aliases: vec!["web".to_string()],
+            },
+        );
+        networks.insert(
+            "public".to_string(),
+            NetworkInfo {
+                ip_address: public_ip.to_string(),
+                aliases: vec!["web".to_string()],
+            },
+        );
+        ContainerInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            ip_address: None,
+            networks,
+            domain_names: vec![format!("default:{dev_domain}")],
+            running: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_release_hostnames_with_network_filter_only_drops_that_networks_claims() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(
+            docker,
+            temp_file.path().to_path_buf(),
+            ".docker".to_string(),
+            true,
+            100,
+        );
+
+        let main = multi_network_web(
+            "main-id",
+            "urq-web-1",
+            "urq_default",
+            "172.22.0.3",
+            "172.21.0.3",
+            "dkarlovi-dev.urq.app",
+        );
+        seed_container_claimed(&sync, "main-id", main.clone()).await;
+
+        // Sanity: every hostname is claimed by main.
+        {
+            let claims: HashMap<String, (String, String)> =
+                sync.hostname_claims.lock().await.clone();
+            for h in ["dkarlovi-dev.urq.app", "web.urq_default", "web.public"] {
+                assert_eq!(
+                    claims.get(h).map(|(id, _)| id.as_str()),
+                    Some("main-id"),
+                    "precondition: {h} owned by main"
+                );
+            }
+        }
+
+        // Simulate a `disconnect` from the shared `public` network only.
+        sync.release_hostnames("main-id", &main, Some("public"))
+            .await;
+
+        let claims: HashMap<String, (String, String)> = sync.hostname_claims.lock().await.clone();
+        assert_eq!(
+            claims.get("web.public").map(|(id, _)| id.as_str()),
+            None,
+            "the public-bound hostname is released"
+        );
+        assert_eq!(
+            claims
+                .get("dkarlovi-dev.urq.app")
+                .map(|(id, _)| id.as_str()),
+            Some("main-id"),
+            "the dev domain stays with main — it lives on urq_default, not public"
+        );
+        assert_eq!(
+            claims.get("web.urq_default").map(|(id, _)| id.as_str()),
+            Some("main-id"),
+            "the urq_default alias also stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_release_hostnames_none_releases_every_claim() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(
+            docker,
+            temp_file.path().to_path_buf(),
+            ".docker".to_string(),
+            true,
+            100,
+        );
+
+        let main = multi_network_web(
+            "main-id",
+            "urq-web-1",
+            "urq_default",
+            "172.22.0.3",
+            "172.21.0.3",
+            "dkarlovi-dev.urq.app",
+        );
+        seed_container_claimed(&sync, "main-id", main.clone()).await;
+
+        sync.release_hostnames("main-id", &main, None).await;
+
+        let claims: HashMap<String, (String, String)> = sync.hostname_claims.lock().await.clone();
+        for h in ["dkarlovi-dev.urq.app", "web.urq_default", "web.public"] {
+            assert!(
+                !claims.contains_key(h),
+                "full release should drop {h}, but it's still claimed"
+            );
+        }
+    }
+
+    /// Encodes the originally hypothesised race: while main is up and owns the
+    /// dev domain on its `_default` network, a sibling worktree project comes
+    /// up and disturbs the shared `public` network. Before the fix, a `public`
+    /// disconnect was treated as a full container teardown and released every
+    /// claim main held — including the dev domain on `_default`. A sibling
+    /// whose env still listed the main dev domain could then take it. After
+    /// the fix, the dev domain stays with main regardless of what happens on
+    /// `public`.
+    #[tokio::test]
+    async fn test_network_disconnect_does_not_let_sibling_steal_other_networks_hostname() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(
+            docker,
+            temp_file.path().to_path_buf(),
+            ".docker".to_string(),
+            true,
+            100,
+        );
+
+        let main = multi_network_web(
+            "main-id",
+            "urq-web-1",
+            "urq_default",
+            "172.22.0.3",
+            "172.21.0.3",
+            "dkarlovi-dev.urq.app",
+        );
+        let worktree = multi_network_web(
+            "wt-id",
+            "urq-fix-worktrees-web-1",
+            "urq-fix-worktrees_default",
+            "172.25.0.3",
+            "172.21.0.4",
+            "dkarlovi-dev.urq.app",
+        );
+
+        seed_container_claimed(&sync, "main-id", main.clone()).await;
+
+        sync.release_hostnames("main-id", &main, Some("public"))
+            .await;
+        sync.claim_hostnames("wt-id", &worktree).await;
+
+        let claims: HashMap<String, (String, String)> = sync.hostname_claims.lock().await.clone();
+        assert_eq!(
+            claims
+                .get("dkarlovi-dev.urq.app")
+                .map(|(id, _)| id.as_str()),
+            Some("main-id"),
+            "main must keep the dev domain through a `public` disconnect — \
+             otherwise /etc/hosts would flip to the worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_network_event_targets_extracts_container_and_network_from_attributes() {
+        let mut attrs = HashMap::new();
+        attrs.insert("container".to_string(), "abc123".to_string());
+        attrs.insert("name".to_string(), "public".to_string());
+        attrs.insert("type".to_string(), "bridge".to_string());
+        let actor = EventActor {
+            id: Some("net-id".to_string()),
+            attributes: Some(attrs),
+        };
+        assert_eq!(
+            Synchronizer::network_event_targets(Some(&actor)),
+            Some(("abc123".to_string(), "public".to_string()))
+        );
+
+        let actor_missing = EventActor {
+            id: Some("net-id".to_string()),
+            attributes: Some(HashMap::new()),
+        };
+        assert_eq!(
+            Synchronizer::network_event_targets(Some(&actor_missing)),
+            None
+        );
+        assert_eq!(Synchronizer::network_event_targets(None), None);
     }
 }
