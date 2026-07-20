@@ -29,7 +29,7 @@ RUN cargo auditable build --release --target $(cat /tmp/rust-target) && \
     mkdir -p /output && \
     cp /usr/src/app/target/$(cat /tmp/rust-target)/release/docker-hostmanager /output/docker-hostmanager
 
-FROM gcr.io/distroless/static-debian12
+FROM gcr.io/distroless/static-debian13
 COPY --from=builder /output/docker-hostmanager /bin/docker-hostmanager
 ENV TLD=.docker
 ENV DOCKER_SOCKET=unix:///var/run/docker.sock
