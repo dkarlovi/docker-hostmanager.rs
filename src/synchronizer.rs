@@ -5,17 +5,209 @@ use bollard::Docker;
 use colored::Colorize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 
+use crate::health::HealthState;
 use crate::types::{ContainerInfo, NetworkInfo};
 
 const START_TAG: &str = "## docker-hostmanager-start";
 const END_TAG: &str = "## docker-hostmanager-end";
+
+/// How often the event loop refreshes its liveness timestamp when Docker is quiet.
+const HEARTBEAT_SECS: u64 = 10;
+
+/// Whether the hosts file can be protected against a write failing part-way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReservationSupport {
+    /// Space can be reserved up front, so a failed write cannot damage the file.
+    /// Only reachable on Linux, the only platform offering a reservation.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Available,
+    /// No reservation is possible; only the restore-on-failure path applies.
+    Unavailable(String),
+    /// The file cannot be opened for writing at all, so *every* update will
+    /// fail. Worth reporting separately and loudly: it is a misconfiguration
+    /// rather than a weaker guarantee.
+    NotWritable(String),
+}
+
+/// Checks whether space reservation actually works for `path`.
+///
+/// This probes the real file rather than inferring from the platform, because
+/// support is a property of the *filesystem*: a Linux kernel says nothing about
+/// whether the particular filesystem under `/etc/hosts` implements `fallocate`.
+///
+/// The probe cannot disturb the file. For a non-empty file it reserves exactly
+/// the bytes already occupied, which changes neither size nor contents; for an
+/// empty one it uses `FALLOC_FL_KEEP_SIZE`, which reserves a block while leaving
+/// the file empty.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn probe_reservation_support(path: &Path) -> ReservationSupport {
+    use std::os::unix::io::AsRawFd;
+
+    let file = match fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        Err(e) => return ReservationSupport::NotWritable(e.to_string()),
+    };
+    let size = file.metadata().map_or(0, |m| m.len());
+
+    let (mode, len) = if size > 0 {
+        (0, i64::try_from(size).unwrap_or(i64::MAX))
+    } else {
+        (libc::FALLOC_FL_KEEP_SIZE, 1)
+    };
+
+    // SAFETY: `file` owns a valid open file descriptor for the whole call, and
+    // `fallocate` only inspects that descriptor and the three integer arguments.
+    let rc = unsafe { libc::fallocate(file.as_raw_fd(), mode, 0, len) };
+    if rc == 0 {
+        ReservationSupport::Available
+    } else {
+        ReservationSupport::Unavailable(std::io::Error::last_os_error().to_string())
+    }
+}
+
+/// Elsewhere there is no reservation to offer, but the writability check is
+/// still worth doing — it catches a misconfigured target at startup.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn probe_reservation_support(path: &Path) -> ReservationSupport {
+    match fs::OpenOptions::new().write(true).open(path) {
+        Ok(_) => ReservationSupport::Unavailable("only supported on Linux".to_string()),
+        Err(e) => ReservationSupport::NotWritable(e.to_string()),
+    }
+}
+
+/// Reserves `len` bytes for `file`, so a subsequent write cannot fail for want
+/// of space. Returns `Ok(false)` when no such guarantee is available, which the
+/// caller treats as a reason to proceed carefully rather than to give up.
+///
+/// Linux gets the real thing via `fallocate(2)`. This is the deployment target
+/// that matters — the daemon ships as a Linux container — and it is what makes
+/// the ENOSPC guarantee above hold.
+#[cfg(target_os = "linux")]
+fn reserve_space(file: &fs::File, len: usize) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+
+    let reserve = i64::try_from(len)
+        .map_err(|_ignored| std::io::Error::other("hosts file content too large"))?;
+
+    // SAFETY: `file` owns a valid open file descriptor for the whole call, and
+    // `fallocate` only inspects that descriptor and the three integer arguments.
+    let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, reserve) };
+    if rc == 0 {
+        return Ok(true);
+    }
+
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        // Not every filesystem implements fallocate; fall back rather than
+        // refuse to write at all.
+        Some(libc::EOPNOTSUPP | libc::ENOSYS) => Ok(false),
+        _ => Err(err),
+    }
+}
+
+/// macOS and Windows have no portable equivalent that is worth the complexity
+/// here, so they rely on the caller's restore-on-failure path instead.
+#[cfg(not(target_os = "linux"))]
+fn reserve_space(_file: &fs::File, _len: usize) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+/// Writes `content` to `path` without ever leaving the file truncated, empty or
+/// half-written, restoring `previous` if the write fails once already underway.
+///
+/// The obvious implementation — write a temporary file, then rename it over the
+/// target — is **not** available here. The hosts file is bind-mounted into the
+/// container as a single file (`/etc/hosts` -> `/hosts`), and a rename replaces
+/// the inode: the container's mount would stay pinned to the old, orphaned inode
+/// and every later write would vanish while the real file froze. (Renaming over
+/// a mount point fails with `EBUSY` in the first place.) The write therefore has
+/// to happen in place, on the same inode.
+///
+/// What makes that safe is reserving the space with `fallocate(2)` *before*
+/// modifying anything. On a full filesystem the reservation fails while the old
+/// contents are still completely intact, so the caller gets an error instead of
+/// a destroyed hosts file.
+///
+/// This replaces a `fs::write` call, which is `File::create` + `write_all` —
+/// `O_TRUNC` first, write second. On 2026-08-07 a transient ENOSPC on the host
+/// hit exactly that window and left the user's `/etc/hosts` at zero bytes.
+///
+/// The reservation is Linux-only (see [`reserve_space`]); elsewhere the
+/// restore-on-failure path below is what keeps the file consistent.
+fn write_in_place(path: &Path, content: &str, previous: &str) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let bytes = content.as_bytes();
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("Failed to open {} for writing", path.display()))?;
+
+    // The step that must fail on a full filesystem, while the old contents
+    // are still there. Note this deliberately does not truncate first.
+    match reserve_space(&file, bytes.len()) {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(
+                "No space reservation available for {}, writing without one",
+                path.display()
+            );
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "Failed to reserve {} bytes for {}; leaving it unchanged",
+                    bytes.len(),
+                    path.display()
+                )
+            });
+        }
+    }
+
+    let write = |file: &mut fs::File, data: &[u8]| -> std::io::Result<()> {
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(data)?;
+        // Trim whatever the previous, longer contents left behind.
+        file.set_len(data.len() as u64)?;
+        file.sync_all()
+    };
+
+    if let Err(e) = write(&mut file, bytes) {
+        // Space was reserved, so this is not ENOSPC — but the file may now be
+        // partially written, which is worse than either state. Put back what
+        // was there before, best effort.
+        warn!(
+            "Write to {} failed after space was reserved; restoring previous contents",
+            path.display()
+        );
+        if let Err(restore) = write(&mut file, previous.as_bytes()) {
+            error!(
+                "Failed to restore previous contents of {}: {restore}",
+                path.display()
+            );
+        }
+        return Err(e).with_context(|| format!("Failed to write {}", path.display()));
+    }
+
+    Ok(())
+}
+
+/// A hostname a container could not claim because another container owns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostnameConflict {
+    pub hostname: String,
+    pub owner_name: String,
+}
 
 pub struct Synchronizer {
     docker: Docker,
@@ -29,6 +221,7 @@ pub struct Synchronizer {
     /// because they always include a unique network name.
     hostname_claims: Arc<Mutex<HashMap<String, (String, String)>>>,
     write_notify: Notify,
+    health: Arc<HealthState>,
 }
 
 impl Synchronizer {
@@ -48,7 +241,14 @@ impl Synchronizer {
             active_containers: Arc::new(Mutex::new(HashMap::new())),
             hostname_claims: Arc::new(Mutex::new(HashMap::new())),
             write_notify: Notify::new(),
+            health: Arc::new(HealthState::new()),
         }
+    }
+
+    /// Shared liveness state, for the health socket served alongside the event loop.
+    #[must_use]
+    pub fn health(&self) -> Arc<HealthState> {
+        Arc::clone(&self.health)
     }
 
     pub async fn synchronize(&self) -> Result<()> {
@@ -111,7 +311,15 @@ impl Synchronizer {
             active.insert(id, info);
         }
 
-        self.write_hosts_file_immediate().await?;
+        // As in `process_pending_writes`, a failure here is logged rather than
+        // fatal: the daemon stays up and retries on the next container event.
+        match self.write_hosts_file_immediate().await {
+            Ok(()) => self.health.set_write_ok(true),
+            Err(e) => {
+                self.health.set_write_ok(false);
+                error!("Failed to write hosts file during initial sync (will retry on next event): {e:#}");
+            }
+        }
 
         Ok(())
     }
@@ -133,7 +341,18 @@ impl Synchronizer {
 
                 tokio::select! {
                     () = sleep(Duration::from_millis(self.debounce_ms)) => {
-                        self.write_hosts_file_immediate().await?;
+                        // A write failure must never take the daemon down. On
+                        // 2026-08-07 a transient ENOSPC propagated from here,
+                        // aborted `listen_events`, exited `main`, and left the
+                        // user without hostname management for hours. Log it and
+                        // keep serving; the next event retries the write.
+                        match self.write_hosts_file_immediate().await {
+                            Ok(()) => self.health.set_write_ok(true),
+                            Err(e) => {
+                                self.health.set_write_ok(false);
+                                error!("Failed to write hosts file (will retry on next event): {e:#}");
+                            }
+                        }
                         break;
                     }
                     () = notified => {
@@ -159,6 +378,7 @@ impl Synchronizer {
         tokio::select! {
             result = async {
                 while let Some(event_result) = events.next().await {
+                    self.health.touch();
                     match event_result {
                         Ok(event) => {
                             if let Err(e) = self.handle_event(event).await {
@@ -173,6 +393,19 @@ impl Synchronizer {
                 Ok(())
             } => result,
             result = self.process_pending_writes() => result,
+            result = self.mark_alive() => result,
+        }
+    }
+
+    /// Keeps the liveness timestamp fresh on a quiet Docker host, where hours can
+    /// pass without a single container event. Because the runtime is
+    /// `current_thread`, this stops advancing the moment anything blocks the
+    /// event loop, which is exactly what the health probe needs to see.
+    async fn mark_alive(&self) -> Result<()> {
+        let mut ticker = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+        loop {
+            ticker.tick().await;
+            self.health.touch();
         }
     }
 
@@ -463,13 +696,21 @@ impl Synchronizer {
 
     /// Attempts to claim all hostnames generated by `container`. The first container
     /// to claim a hostname owns it until it stops. Warns once on conflict.
-    async fn claim_hostnames(&self, container_id: &str, container: &ContainerInfo) {
+    ///
+    /// Returns the conflicts that were skipped, so callers (and tests) can observe
+    /// them without scraping log output.
+    async fn claim_hostnames(
+        &self,
+        container_id: &str,
+        container: &ContainerInfo,
+    ) -> Vec<HostnameConflict> {
         let all_hostnames: Vec<String> = container
             .get_hostnames(&self.tld)
             .into_iter()
             .flat_map(|(_, hosts)| hosts)
             .collect();
 
+        let mut conflicts = Vec::new();
         let mut claims = self.hostname_claims.lock().await;
         for hostname in all_hostnames {
             match claims.entry(hostname.clone()) {
@@ -480,15 +721,28 @@ impl Synchronizer {
                     );
                     e.insert((container_id.to_string(), container.name.clone()));
                 }
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    let (_, owner_name) = e.get();
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let (owner_id, owner_name) = e.get().clone();
+                    if owner_id == container_id {
+                        // Not a conflict: `handle_container_up` runs for both the
+                        // container `start` and the network `connect` event, so a
+                        // container re-claims its own hostnames. Refresh the
+                        // recorded name and move on.
+                        e.insert((container_id.to_string(), container.name.clone()));
+                        continue;
+                    }
                     warn!(
                         "Hostname \"{}\" already claimed by \"{}\", skipping for \"{}\"",
                         hostname, owner_name, container.name
                     );
+                    conflicts.push(HostnameConflict {
+                        hostname,
+                        owner_name,
+                    });
                 }
             }
         }
+        conflicts
     }
 
     /// Releases hostname claims held by `container_id`. When `only_network` is
@@ -655,11 +909,15 @@ impl Synchronizer {
         let end_idx = lines.iter().position(|line| line.trim() == END_TAG);
 
         let mut new_lines = Vec::new();
+        // Every line the user owns, i.e. everything outside our managed section.
+        // Checked against the rendered result below so we can never drop one.
+        let mut preserved: Vec<&str> = Vec::new();
 
         match (start_idx, end_idx) {
             (Some(start), Some(end)) if start < end => {
                 // Managed section exists - replace it
                 if let Some(before_managed) = lines.get(..start) {
+                    preserved.extend(before_managed.iter().copied());
                     new_lines.extend(before_managed.iter().map(std::string::ToString::to_string));
                 }
 
@@ -673,6 +931,7 @@ impl Synchronizer {
 
                 if end + 1 < lines.len() {
                     if let Some(after_managed) = lines.get(end + 1..) {
+                        preserved.extend(after_managed.iter().copied());
                         new_lines
                             .extend(after_managed.iter().map(std::string::ToString::to_string));
                     }
@@ -680,6 +939,7 @@ impl Synchronizer {
             }
             _ => {
                 // No valid managed section - append to end
+                preserved.extend(lines.iter().copied());
                 new_lines.extend(lines.iter().map(std::string::ToString::to_string));
 
                 if !host_entries.is_empty() {
@@ -699,7 +959,19 @@ impl Synchronizer {
 
         let new_content = new_lines.join("\n") + "\n";
 
-        fs::write(&self.hosts_file, new_content).context("Failed to write hosts file")?;
+        // Last line of defence before touching the file: whatever happens to the
+        // managed section, not one line the user wrote may go missing.
+        if let Some(dropped) = preserved
+            .iter()
+            .find(|line| !new_lines.iter().any(|kept| kept == *line))
+        {
+            return Err(anyhow::anyhow!(
+                "refusing to write {}: it would drop the existing line {dropped:?}",
+                self.hosts_file.display()
+            ));
+        }
+
+        write_in_place(&self.hosts_file, &new_content, &content)?;
 
         if container_count == 0 {
             println!(
@@ -1932,5 +2204,342 @@ mod tests {
             None
         );
         assert_eq!(Synchronizer::network_event_targets(None), None);
+    }
+
+    // ---- regression tests for the 2026-08-07 incident ----------------------
+    //
+    // A transient ENOSPC on the host truncated the user's /etc/hosts to zero
+    // bytes and killed the daemon. Three distinct defects were involved; each
+    // gets a test below.
+
+    #[test]
+    fn test_probe_reservation_support_on_a_normal_file() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        let original = "127.0.0.1 localhost\n10.0.0.5 keep-me\n";
+        fs::write(&path, original).unwrap();
+
+        let support = probe_reservation_support(&path);
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                support,
+                ReservationSupport::Available,
+                "a regular file on a normal filesystem should support reservation"
+            );
+        }
+
+        // The probe must never disturb the file it is asked about.
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "probing changed the file's contents"
+        );
+    }
+
+    /// The hosts file was left at zero bytes by the incident, so the empty case
+    /// is not hypothetical: probing it must not make it non-empty.
+    #[test]
+    fn test_probe_reservation_support_leaves_an_empty_file_empty() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        fs::write(&path, "").unwrap();
+
+        let support = probe_reservation_support(&path);
+        if cfg!(target_os = "linux") {
+            assert_eq!(support, ReservationSupport::Available);
+        }
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            0,
+            "probing an empty hosts file must leave it empty"
+        );
+    }
+
+    #[test]
+    fn test_probe_reservation_support_reports_unwritable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-hosts-file");
+
+        let support = probe_reservation_support(&missing);
+        assert!(
+            matches!(support, ReservationSupport::NotWritable(_)),
+            "a file that cannot be opened for writing must be reported as such, got {support:?}"
+        );
+    }
+
+    /// A read-only target is a misconfiguration, not merely a weaker guarantee,
+    /// so it must be distinguishable from an unsupported filesystem.
+    #[test]
+    fn test_probe_reservation_support_distinguishes_read_only_target() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            perms.set_mode(0o444);
+        }
+        #[cfg(not(unix))]
+        perms.set_readonly(true);
+        fs::set_permissions(&path, perms).unwrap();
+
+        let support = probe_reservation_support(&path);
+
+        // Restore permissions so the temp file can be cleaned up.
+        let mut restore = fs::metadata(&path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            restore.set_mode(0o644);
+        }
+        #[cfg(not(unix))]
+        restore.set_readonly(false);
+        fs::set_permissions(&path, restore).unwrap();
+
+        assert!(
+            matches!(support, ReservationSupport::NotWritable(_)),
+            "a read-only hosts file must be reported as not writable, got {support:?}"
+        );
+    }
+
+    fn test_container(id: &str, name: &str, ip: &str) -> ContainerInfo {
+        ContainerInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            ip_address: Some(ip.to_string()),
+            networks: HashMap::new(),
+            domain_names: vec![],
+            running: true,
+        }
+    }
+
+    fn new_sync(path: PathBuf, write_enabled: bool, debounce_ms: u64) -> Synchronizer {
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        Synchronizer::new(
+            docker,
+            path,
+            ".docker".to_string(),
+            write_enabled,
+            debounce_ms,
+        )
+    }
+
+    /// Defect 3: `handle_container_up` runs for both the `container start` and
+    /// the `network connect` event, so `claim_hostnames` is called twice for the
+    /// same container. The second pass must not warn that the container stole
+    /// the hostname from itself.
+    #[tokio::test]
+    async fn test_reclaim_by_same_container_reports_no_conflict() {
+        let sync = new_sync(PathBuf::from("/dev/null"), false, 100);
+        let info = test_container("abc123", "lucid_heisenberg", "172.17.0.2");
+
+        // container start
+        let first = sync.claim_hostnames("abc123", &info).await;
+        // network connect for the very same container
+        let second = sync.claim_hostnames("abc123", &info).await;
+
+        assert!(
+            first.is_empty(),
+            "the initial claim must not conflict, got: {first:?}"
+        );
+        assert!(
+            second.is_empty(),
+            "a container re-claiming its own hostname must not be reported as a conflict, got: {second:?}"
+        );
+
+        let owner = {
+            let claims = sync.hostname_claims.lock().await;
+            claims
+                .get("lucid_heisenberg.docker")
+                .map(|(id, _)| id.clone())
+        };
+        assert_eq!(
+            owner.as_deref(),
+            Some("abc123"),
+            "the container must still own its hostname after re-claiming"
+        );
+    }
+
+    /// Guards the fix above from over-correcting: a genuine conflict between two
+    /// different containers must still be reported.
+    #[tokio::test]
+    async fn test_conflict_between_different_containers_is_reported() {
+        let sync = new_sync(PathBuf::from("/dev/null"), false, 100);
+        let first = test_container("aaa", "shared", "172.17.0.2");
+        let second = test_container("bbb", "shared", "172.17.0.3");
+
+        assert!(sync.claim_hostnames("aaa", &first).await.is_empty());
+        let conflicts = sync.claim_hostnames("bbb", &second).await;
+
+        assert_eq!(
+            conflicts,
+            vec![HostnameConflict {
+                hostname: "shared.docker".to_string(),
+                owner_name: "shared".to_string(),
+            }],
+            "a real conflict between two different containers must still be reported"
+        );
+
+        let owner = {
+            let claims = sync.hostname_claims.lock().await;
+            claims.get("shared.docker").map(|(id, _)| id.clone())
+        };
+        assert_eq!(
+            owner.as_deref(),
+            Some("aaa"),
+            "the first claimant must keep ownership"
+        );
+    }
+
+    /// Defect 2: a write failure propagated out of `process_pending_writes`,
+    /// which aborted `listen_events` and exited `main`. One transient ENOSPC
+    /// killed the daemon permanently. The loop must survive a failing write.
+    #[tokio::test]
+    async fn test_write_error_does_not_terminate_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        // Path inside a directory that does not exist: every write attempt fails.
+        let unwritable = dir.path().join("missing-dir").join("hosts");
+
+        let sync = new_sync(unwritable, true, 20);
+        seed_container(&sync, "abc123", "nginx", "172.17.0.2").await;
+
+        sync.schedule_write();
+
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(400), sync.process_pending_writes()).await;
+
+        assert!(
+            outcome.is_err(),
+            "process_pending_writes must keep looping after a failed write, but it returned: {outcome:?}"
+        );
+    }
+
+    /// Byte ceiling imposed on the child process below. Small enough that the
+    /// rendered managed section cannot fit, large enough for the starting file.
+    #[cfg(target_os = "linux")]
+    const FSIZE_LIMIT: u64 = 4096;
+
+    #[cfg(target_os = "linux")]
+    const FSIZE_LIMIT_VAR: &str = "HOSTMANAGER_FSIZE_LIMIT";
+
+    /// Caps the file size this process may create, so a large write fails partway
+    /// exactly as it does on a full filesystem.
+    ///
+    /// `RLIMIT_FSIZE` is used rather than a real small filesystem because it needs
+    /// no privileges: mounting even a rootless tmpfs requires user namespaces,
+    /// which Ubuntu 23.10+ (and therefore GitHub Actions) blocks by default via
+    /// `kernel.apparmor_restrict_unprivileged_userns`. The kernel path is the same
+    /// one ENOSPC takes: `fallocate` refuses up front with `EFBIG` and leaves the
+    /// file untouched, while a plain write truncates first and fails halfway.
+    #[cfg(target_os = "linux")]
+    fn apply_fsize_limit(limit: u64) {
+        let rlimit = libc::rlimit {
+            rlim_cur: limit,
+            rlim_max: limit,
+        };
+        // SAFETY: both calls take plain scalars and a pointer to the local above,
+        // and affect only this process, which exists solely to run this one test.
+        unsafe {
+            // Exceeding the limit also raises SIGXFSZ, which would kill the
+            // process before the write could return an error to inspect.
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            libc::setrlimit(libc::RLIMIT_FSIZE, &raw const rlimit);
+        }
+    }
+
+    /// Re-runs a single test in a child process under the file size limit.
+    ///
+    /// The limit is process-wide, so it cannot be set in the test process itself
+    /// without breaking every other test writing temporary files in parallel.
+    #[cfg(target_os = "linux")]
+    fn reexec_under_fsize_limit(test_name: &str) -> std::process::Output {
+        let exe = std::env::current_exe().expect("cannot locate the test binary");
+        std::process::Command::new(exe)
+            .args(["--exact", test_name, "--nocapture"])
+            .env(FSIZE_LIMIT_VAR, FSIZE_LIMIT.to_string())
+            .output()
+            .expect("failed to re-exec the test binary")
+    }
+
+    /// Defect 1, the one that cost the user their `/etc/hosts`.
+    ///
+    /// Linux-only: the guarantee under test comes from `fallocate(2)`, and the
+    /// harness leans on `RLIMIT_FSIZE`. Both are Linux specifics.
+    ///
+    /// `fs::write` is `File::create` + `write_all`, i.e. `O_TRUNC` first and
+    /// write second. When the write fails the file is already truncated, so a
+    /// transient ENOSPC leaves a zero-byte hosts file — or, with a little space
+    /// left, one cut off mid-line. The previous contents must survive intact.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_failed_write_preserves_existing_hosts_file() {
+        let Some(limit) = std::env::var(FSIZE_LIMIT_VAR)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            // Parent side: hand the work to a child process, because the file
+            // size limit it needs would otherwise apply to every test.
+            let output = reexec_under_fsize_limit(
+                "synchronizer::tests::test_failed_write_preserves_existing_hosts_file",
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "the write-safety regression failed:\n{}\n--- stdout ---\n{stdout}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // A name that no longer matches would run zero tests and still exit
+            // 0, silently turning this into a test that checks nothing.
+            assert!(
+                stdout.contains("1 passed"),
+                "the child ran no test — has this test been renamed?\n{stdout}"
+            );
+            return;
+        };
+
+        apply_fsize_limit(limit);
+
+        let dir = tempfile::tempdir().unwrap();
+        let hosts = dir.path().join("hosts");
+        let original = "127.0.0.1 localhost localhost.localdomain\n\
+                        ::1 localhost localhost.localdomain\n\
+                        10.0.0.5 my-precious-manual-entry\n";
+        fs::write(&hosts, original).unwrap();
+
+        let sync = new_sync(hosts.clone(), true, 100);
+
+        // Enough containers that the rendered section far exceeds the limit.
+        for i in 0..150 {
+            seed_container(
+                &sync,
+                &format!("container{i}"),
+                &format!("a-fairly-long-container-name-number-{i}"),
+                &format!("172.17.{}.{}", i / 256, i % 256),
+            )
+            .await;
+        }
+
+        let result = sync.write_hosts_file_immediate().await;
+        assert!(
+            result.is_err(),
+            "the write was expected to fail against the {limit} byte file size limit"
+        );
+
+        let after = fs::read_to_string(&hosts).unwrap();
+        assert!(
+            after.contains("my-precious-manual-entry"),
+            "a failed write destroyed the user's hosts file; it is now {} bytes",
+            after.len()
+        );
+        assert!(
+            after == original,
+            "a failed write corrupted the hosts file: {} bytes now, {} before.\nIt now ends with: {:?}",
+            after.len(),
+            original.len(),
+            after.get(after.len().saturating_sub(60)..).unwrap_or("")
+        );
     }
 }

@@ -33,5 +33,11 @@ FROM gcr.io/distroless/static-debian13
 COPY --from=builder /output/docker-hostmanager /bin/docker-hostmanager
 ENV TLD=.docker
 ENV DOCKER_SOCKET=unix:///var/run/docker.sock
+ENV HEALTH_SOCKET=/tmp/hostmanager.sock
+# Exec form on purpose: the image has no shell, so the usual `CMD some command`
+# string form (which is wrapped in `/bin/sh -c`) could never run here. The probe
+# is this same binary acting as a client against the socket the daemon serves.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/bin/docker-hostmanager", "health"]
 ENTRYPOINT ["/bin/docker-hostmanager"]
 CMD ["sync", "/hosts"]

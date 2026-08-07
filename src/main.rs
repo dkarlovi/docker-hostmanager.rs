@@ -5,10 +5,11 @@ use colored::Colorize;
 use std::path::PathBuf;
 use tokio::signal;
 
+mod health;
 mod synchronizer;
 mod types;
 
-use synchronizer::Synchronizer;
+use synchronizer::{probe_reservation_support, ReservationSupport, Synchronizer};
 
 // Version from git tag at build time
 const VERSION: &str = env!("GIT_VERSION");
@@ -44,6 +45,19 @@ struct Args {
     #[arg(long, env = "DEBOUNCE_MS", default_value = "100", global = true)]
     debounce_ms: u64,
 
+    /// Path to the unix socket used for health probes
+    #[arg(
+        long,
+        env = "HEALTH_SOCKET",
+        default_value = "/tmp/hostmanager.sock",
+        global = true
+    )]
+    health_socket: PathBuf,
+
+    /// Treat the instance as unhealthy if the event loop has been idle this long
+    #[arg(long, env = "HEALTH_MAX_AGE_SECS", default_value = "90", global = true)]
+    health_max_age_secs: u64,
+
     /// Verbose mode
     #[arg(short, long, global = true)]
     verbose: bool,
@@ -67,6 +81,8 @@ enum Commands {
         #[arg(long)]
         once: bool,
     },
+    /// Probe a running instance over its health socket (used by HEALTHCHECK)
+    Health,
     /// Show version information
     Version,
 }
@@ -87,6 +103,20 @@ async fn main() -> Result<()> {
         .with_target(false)
         .with_ansi(true)
         .init();
+
+    // Answer health probes before anything else: a probe must not print the
+    // banner, and must not need a Docker connection to report on this instance.
+    if matches!(args.command, Some(Commands::Health)) {
+        let summary = health::probe(
+            &args.health_socket,
+            args.health_max_age_secs,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .context("health check failed")?;
+        println!("{summary}");
+        return Ok(());
+    }
 
     println!("{}", "Docker Host Manager".bright_cyan().bold());
     println!("{}", "===================".bright_cyan());
@@ -118,6 +148,8 @@ async fn main() -> Result<()> {
     let command = args.command.unwrap_or(Commands::Watch { once: false });
 
     match command {
+        // Already handled above, before the Docker connection was made.
+        Commands::Health => return Ok(()),
         Commands::Version => {
             println!("dkarlovi/{PACKAGE_NAME} {VERSION}");
             return Ok(());
@@ -126,6 +158,12 @@ async fn main() -> Result<()> {
             println!(
                 "{} Watch mode - displaying hostname changes only",
                 "ℹ".bright_blue()
+            );
+            // No reservation line here: watch mode never writes a hosts file.
+            println!(
+                "{} Health socket: {}",
+                "ℹ".bright_blue(),
+                args.health_socket.display().to_string().bright_white()
             );
             println!();
 
@@ -136,6 +174,7 @@ async fn main() -> Result<()> {
                 false, // Never write in watch mode
                 args.debounce_ms,
             );
+            let health_state = sync.health();
 
             println!(
                 "{}",
@@ -161,6 +200,7 @@ async fn main() -> Result<()> {
                 result = sync.listen_events() => {
                     result?;
                 }
+                () = health::serve(health_state, args.health_socket.clone()) => {}
                 _ = signal::ctrl_c() => {
                     println!();
                     println!("{}", "Received shutdown signal, exiting gracefully...".bright_yellow());
@@ -182,6 +222,28 @@ async fn main() -> Result<()> {
                 "✓".bright_green(),
                 hosts_file.display()
             );
+            match probe_reservation_support(&hosts_file) {
+                ReservationSupport::Available => println!(
+                    "{} Space reservation active - a failed write cannot damage the file",
+                    "✓".bright_green()
+                ),
+                ReservationSupport::Unavailable(reason) => println!(
+                    "{} Space reservation unavailable ({}) - falling back to restore-on-failure",
+                    "⚠".bright_yellow(),
+                    reason.bright_white()
+                ),
+                ReservationSupport::NotWritable(reason) => println!(
+                    "{} Cannot open {} for writing ({}) - every update will fail",
+                    "✗".bright_red(),
+                    hosts_file.display(),
+                    reason.bright_white()
+                ),
+            }
+            println!(
+                "{} Health socket: {}",
+                "ℹ".bright_blue(),
+                args.health_socket.display().to_string().bright_white()
+            );
             println!();
 
             let sync = Synchronizer::new(
@@ -191,6 +253,7 @@ async fn main() -> Result<()> {
                 true, // Always write in sync mode
                 args.debounce_ms,
             );
+            let health_state = sync.health();
 
             println!(
                 "{}",
@@ -216,6 +279,7 @@ async fn main() -> Result<()> {
                 result = sync.listen_events() => {
                     result?;
                 }
+                () = health::serve(health_state, args.health_socket.clone()) => {}
                 _ = signal::ctrl_c() => {
                     println!();
                     println!("{}", "Received shutdown signal, exiting gracefully...".bright_yellow());
