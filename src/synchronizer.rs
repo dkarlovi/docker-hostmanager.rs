@@ -5,17 +5,115 @@ use bollard::Docker;
 use colored::Colorize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 
+use crate::health::HealthState;
 use crate::types::{ContainerInfo, NetworkInfo};
 
 const START_TAG: &str = "## docker-hostmanager-start";
 const END_TAG: &str = "## docker-hostmanager-end";
+
+/// How often the event loop refreshes its liveness timestamp when Docker is quiet.
+const HEARTBEAT_SECS: u64 = 10;
+
+/// Writes `content` to `path` without ever leaving the file truncated, empty or
+/// half-written, restoring `previous` if the write fails once already underway.
+///
+/// The obvious implementation — write a temporary file, then rename it over the
+/// target — is **not** available here. The hosts file is bind-mounted into the
+/// container as a single file (`/etc/hosts` -> `/hosts`), and a rename replaces
+/// the inode: the container's mount would stay pinned to the old, orphaned inode
+/// and every later write would vanish while the real file froze. (Renaming over
+/// a mount point fails with `EBUSY` in the first place.) The write therefore has
+/// to happen in place, on the same inode.
+///
+/// What makes that safe is reserving the space with `fallocate(2)` *before*
+/// modifying anything. On a full filesystem the reservation fails while the old
+/// contents are still completely intact, so the caller gets an error instead of
+/// a destroyed hosts file.
+///
+/// This replaces a `fs::write` call, which is `File::create` + `write_all` —
+/// `O_TRUNC` first, write second. On 2026-08-07 a transient ENOSPC on the host
+/// hit exactly that window and left the user's `/etc/hosts` at zero bytes.
+fn write_in_place(path: &Path, content: &str, previous: &str) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::io::AsRawFd;
+
+    let bytes = content.as_bytes();
+    let reserve = i64::try_from(bytes.len()).context("hosts file content too large")?;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("Failed to open {} for writing", path.display()))?;
+
+    // The step that must fail on a full filesystem, while the old contents
+    // are still there. Note this deliberately does not truncate first.
+    // SAFETY: `file` owns a valid open file descriptor for the whole call, and
+    // `fallocate` only inspects the fd and the two integer arguments.
+    let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, reserve) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            // Not every filesystem implements fallocate. Rather than refuse to
+            // write at all, carry on with the weaker guarantee.
+            Some(libc::EOPNOTSUPP | libc::ENOSYS) => {
+                debug!(
+                    "fallocate unsupported on {}, writing without a space reservation",
+                    path.display()
+                );
+            }
+            _ => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to reserve {} bytes for {}; leaving it unchanged",
+                        bytes.len(),
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+
+    let write = |file: &mut fs::File, data: &[u8]| -> std::io::Result<()> {
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(data)?;
+        // Trim whatever the previous, longer contents left behind.
+        file.set_len(data.len() as u64)?;
+        file.sync_all()
+    };
+
+    if let Err(e) = write(&mut file, bytes) {
+        // Space was reserved, so this is not ENOSPC — but the file may now be
+        // partially written, which is worse than either state. Put back what
+        // was there before, best effort.
+        warn!(
+            "Write to {} failed after space was reserved; restoring previous contents",
+            path.display()
+        );
+        if let Err(restore) = write(&mut file, previous.as_bytes()) {
+            error!(
+                "Failed to restore previous contents of {}: {restore}",
+                path.display()
+            );
+        }
+        return Err(e).with_context(|| format!("Failed to write {}", path.display()));
+    }
+
+    Ok(())
+}
+
+/// A hostname a container could not claim because another container owns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostnameConflict {
+    pub hostname: String,
+    pub owner_name: String,
+}
 
 pub struct Synchronizer {
     docker: Docker,
@@ -29,6 +127,7 @@ pub struct Synchronizer {
     /// because they always include a unique network name.
     hostname_claims: Arc<Mutex<HashMap<String, (String, String)>>>,
     write_notify: Notify,
+    health: Arc<HealthState>,
 }
 
 impl Synchronizer {
@@ -48,7 +147,14 @@ impl Synchronizer {
             active_containers: Arc::new(Mutex::new(HashMap::new())),
             hostname_claims: Arc::new(Mutex::new(HashMap::new())),
             write_notify: Notify::new(),
+            health: Arc::new(HealthState::new()),
         }
+    }
+
+    /// Shared liveness state, for the health socket served alongside the event loop.
+    #[must_use]
+    pub fn health(&self) -> Arc<HealthState> {
+        Arc::clone(&self.health)
     }
 
     pub async fn synchronize(&self) -> Result<()> {
@@ -111,7 +217,15 @@ impl Synchronizer {
             active.insert(id, info);
         }
 
-        self.write_hosts_file_immediate().await?;
+        // As in `process_pending_writes`, a failure here is logged rather than
+        // fatal: the daemon stays up and retries on the next container event.
+        match self.write_hosts_file_immediate().await {
+            Ok(()) => self.health.set_write_ok(true),
+            Err(e) => {
+                self.health.set_write_ok(false);
+                error!("Failed to write hosts file during initial sync (will retry on next event): {e:#}");
+            }
+        }
 
         Ok(())
     }
@@ -133,7 +247,18 @@ impl Synchronizer {
 
                 tokio::select! {
                     () = sleep(Duration::from_millis(self.debounce_ms)) => {
-                        self.write_hosts_file_immediate().await?;
+                        // A write failure must never take the daemon down. On
+                        // 2026-08-07 a transient ENOSPC propagated from here,
+                        // aborted `listen_events`, exited `main`, and left the
+                        // user without hostname management for hours. Log it and
+                        // keep serving; the next event retries the write.
+                        match self.write_hosts_file_immediate().await {
+                            Ok(()) => self.health.set_write_ok(true),
+                            Err(e) => {
+                                self.health.set_write_ok(false);
+                                error!("Failed to write hosts file (will retry on next event): {e:#}");
+                            }
+                        }
                         break;
                     }
                     () = notified => {
@@ -159,6 +284,7 @@ impl Synchronizer {
         tokio::select! {
             result = async {
                 while let Some(event_result) = events.next().await {
+                    self.health.touch();
                     match event_result {
                         Ok(event) => {
                             if let Err(e) = self.handle_event(event).await {
@@ -173,6 +299,19 @@ impl Synchronizer {
                 Ok(())
             } => result,
             result = self.process_pending_writes() => result,
+            result = self.mark_alive() => result,
+        }
+    }
+
+    /// Keeps the liveness timestamp fresh on a quiet Docker host, where hours can
+    /// pass without a single container event. Because the runtime is
+    /// `current_thread`, this stops advancing the moment anything blocks the
+    /// event loop, which is exactly what the health probe needs to see.
+    async fn mark_alive(&self) -> Result<()> {
+        let mut ticker = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+        loop {
+            ticker.tick().await;
+            self.health.touch();
         }
     }
 
@@ -463,13 +602,21 @@ impl Synchronizer {
 
     /// Attempts to claim all hostnames generated by `container`. The first container
     /// to claim a hostname owns it until it stops. Warns once on conflict.
-    async fn claim_hostnames(&self, container_id: &str, container: &ContainerInfo) {
+    ///
+    /// Returns the conflicts that were skipped, so callers (and tests) can observe
+    /// them without scraping log output.
+    async fn claim_hostnames(
+        &self,
+        container_id: &str,
+        container: &ContainerInfo,
+    ) -> Vec<HostnameConflict> {
         let all_hostnames: Vec<String> = container
             .get_hostnames(&self.tld)
             .into_iter()
             .flat_map(|(_, hosts)| hosts)
             .collect();
 
+        let mut conflicts = Vec::new();
         let mut claims = self.hostname_claims.lock().await;
         for hostname in all_hostnames {
             match claims.entry(hostname.clone()) {
@@ -480,15 +627,28 @@ impl Synchronizer {
                     );
                     e.insert((container_id.to_string(), container.name.clone()));
                 }
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    let (_, owner_name) = e.get();
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let (owner_id, owner_name) = e.get().clone();
+                    if owner_id == container_id {
+                        // Not a conflict: `handle_container_up` runs for both the
+                        // container `start` and the network `connect` event, so a
+                        // container re-claims its own hostnames. Refresh the
+                        // recorded name and move on.
+                        e.insert((container_id.to_string(), container.name.clone()));
+                        continue;
+                    }
                     warn!(
                         "Hostname \"{}\" already claimed by \"{}\", skipping for \"{}\"",
                         hostname, owner_name, container.name
                     );
+                    conflicts.push(HostnameConflict {
+                        hostname,
+                        owner_name,
+                    });
                 }
             }
         }
+        conflicts
     }
 
     /// Releases hostname claims held by `container_id`. When `only_network` is
@@ -655,11 +815,15 @@ impl Synchronizer {
         let end_idx = lines.iter().position(|line| line.trim() == END_TAG);
 
         let mut new_lines = Vec::new();
+        // Every line the user owns, i.e. everything outside our managed section.
+        // Checked against the rendered result below so we can never drop one.
+        let mut preserved: Vec<&str> = Vec::new();
 
         match (start_idx, end_idx) {
             (Some(start), Some(end)) if start < end => {
                 // Managed section exists - replace it
                 if let Some(before_managed) = lines.get(..start) {
+                    preserved.extend(before_managed.iter().copied());
                     new_lines.extend(before_managed.iter().map(std::string::ToString::to_string));
                 }
 
@@ -673,6 +837,7 @@ impl Synchronizer {
 
                 if end + 1 < lines.len() {
                     if let Some(after_managed) = lines.get(end + 1..) {
+                        preserved.extend(after_managed.iter().copied());
                         new_lines
                             .extend(after_managed.iter().map(std::string::ToString::to_string));
                     }
@@ -680,6 +845,7 @@ impl Synchronizer {
             }
             _ => {
                 // No valid managed section - append to end
+                preserved.extend(lines.iter().copied());
                 new_lines.extend(lines.iter().map(std::string::ToString::to_string));
 
                 if !host_entries.is_empty() {
@@ -699,7 +865,19 @@ impl Synchronizer {
 
         let new_content = new_lines.join("\n") + "\n";
 
-        fs::write(&self.hosts_file, new_content).context("Failed to write hosts file")?;
+        // Last line of defence before touching the file: whatever happens to the
+        // managed section, not one line the user wrote may go missing.
+        if let Some(dropped) = preserved
+            .iter()
+            .find(|line| !new_lines.iter().any(|kept| kept == *line))
+        {
+            return Err(anyhow::anyhow!(
+                "refusing to write {}: it would drop the existing line {dropped:?}",
+                self.hosts_file.display()
+            ));
+        }
+
+        write_in_place(&self.hosts_file, &new_content, &content)?;
 
         if container_count == 0 {
             println!(
@@ -1932,5 +2110,230 @@ mod tests {
             None
         );
         assert_eq!(Synchronizer::network_event_targets(None), None);
+    }
+
+    // ---- regression tests for the 2026-08-07 incident ----------------------
+    //
+    // A transient ENOSPC on the host truncated the user's /etc/hosts to zero
+    // bytes and killed the daemon. Three distinct defects were involved; each
+    // gets a test below.
+
+    fn test_container(id: &str, name: &str, ip: &str) -> ContainerInfo {
+        ContainerInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            ip_address: Some(ip.to_string()),
+            networks: HashMap::new(),
+            domain_names: vec![],
+            running: true,
+        }
+    }
+
+    fn new_sync(path: PathBuf, write_enabled: bool, debounce_ms: u64) -> Synchronizer {
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        Synchronizer::new(
+            docker,
+            path,
+            ".docker".to_string(),
+            write_enabled,
+            debounce_ms,
+        )
+    }
+
+    /// Defect 3: `handle_container_up` runs for both the `container start` and
+    /// the `network connect` event, so `claim_hostnames` is called twice for the
+    /// same container. The second pass must not warn that the container stole
+    /// the hostname from itself.
+    #[tokio::test]
+    async fn test_reclaim_by_same_container_reports_no_conflict() {
+        let sync = new_sync(PathBuf::from("/dev/null"), false, 100);
+        let info = test_container("abc123", "lucid_heisenberg", "172.17.0.2");
+
+        // container start
+        let first = sync.claim_hostnames("abc123", &info).await;
+        // network connect for the very same container
+        let second = sync.claim_hostnames("abc123", &info).await;
+
+        assert!(
+            first.is_empty(),
+            "the initial claim must not conflict, got: {first:?}"
+        );
+        assert!(
+            second.is_empty(),
+            "a container re-claiming its own hostname must not be reported as a conflict, got: {second:?}"
+        );
+
+        let owner = {
+            let claims = sync.hostname_claims.lock().await;
+            claims
+                .get("lucid_heisenberg.docker")
+                .map(|(id, _)| id.clone())
+        };
+        assert_eq!(
+            owner.as_deref(),
+            Some("abc123"),
+            "the container must still own its hostname after re-claiming"
+        );
+    }
+
+    /// Guards the fix above from over-correcting: a genuine conflict between two
+    /// different containers must still be reported.
+    #[tokio::test]
+    async fn test_conflict_between_different_containers_is_reported() {
+        let sync = new_sync(PathBuf::from("/dev/null"), false, 100);
+        let first = test_container("aaa", "shared", "172.17.0.2");
+        let second = test_container("bbb", "shared", "172.17.0.3");
+
+        assert!(sync.claim_hostnames("aaa", &first).await.is_empty());
+        let conflicts = sync.claim_hostnames("bbb", &second).await;
+
+        assert_eq!(
+            conflicts,
+            vec![HostnameConflict {
+                hostname: "shared.docker".to_string(),
+                owner_name: "shared".to_string(),
+            }],
+            "a real conflict between two different containers must still be reported"
+        );
+
+        let owner = {
+            let claims = sync.hostname_claims.lock().await;
+            claims.get("shared.docker").map(|(id, _)| id.clone())
+        };
+        assert_eq!(
+            owner.as_deref(),
+            Some("aaa"),
+            "the first claimant must keep ownership"
+        );
+    }
+
+    /// Defect 2: a write failure propagated out of `process_pending_writes`,
+    /// which aborted `listen_events` and exited `main`. One transient ENOSPC
+    /// killed the daemon permanently. The loop must survive a failing write.
+    #[tokio::test]
+    async fn test_write_error_does_not_terminate_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        // Path inside a directory that does not exist: every write attempt fails.
+        let unwritable = dir.path().join("missing-dir").join("hosts");
+
+        let sync = new_sync(unwritable, true, 20);
+        seed_container(&sync, "abc123", "nginx", "172.17.0.2").await;
+
+        sync.schedule_write();
+
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(400), sync.process_pending_writes()).await;
+
+        assert!(
+            outcome.is_err(),
+            "process_pending_writes must keep looping after a failed write, but it returned: {outcome:?}"
+        );
+    }
+
+    /// Locates a small filesystem to exercise ENOSPC against. The test re-execs
+    /// itself inside a user namespace with a tiny tmpfs; if that is unavailable
+    /// (restricted CI sandbox, no `CONFIG_USER_NS`) the test skips cleanly.
+    fn tiny_fs_dir() -> Option<PathBuf> {
+        std::env::var("HOSTMANAGER_TINYFS").ok().map(PathBuf::from)
+    }
+
+    fn reexec_in_tiny_fs(test_name: &str) -> bool {
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        let script = "mkdir -p /tmp/tinyfs \
+             && mount -t tmpfs -o size=128k tmpfs /tmp/tinyfs \
+             && exec \"$0\" --exact \"$1\" --nocapture";
+        let output = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "sh", "-c", script])
+            .arg(exe)
+            .arg(test_name)
+            .env("HOSTMANAGER_TINYFS", "/tmp/tinyfs")
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                // Surface the inner failure; the child's output is otherwise lost.
+                let err = String::from_utf8_lossy(&o.stderr);
+                let out = String::from_utf8_lossy(&o.stdout);
+                let tail: String = out.lines().rev().take(15).collect::<Vec<_>>().join("\n");
+                panic!("ENOSPC regression test failed inside the namespace:\n{err}\n--- stdout tail ---\n{tail}");
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Defect 1, the one that cost the user their `/etc/hosts`.
+    ///
+    /// `fs::write` is `File::create` + `write_all`, i.e. `O_TRUNC` first and
+    /// write second. When the write fails the file is already truncated, so a
+    /// transient ENOSPC leaves a zero-byte hosts file. The previous contents
+    /// must survive a failed write.
+    #[tokio::test]
+    async fn test_failed_write_preserves_existing_hosts_file() {
+        let Some(dir) = tiny_fs_dir() else {
+            if !reexec_in_tiny_fs(
+                "synchronizer::tests::test_failed_write_preserves_existing_hosts_file",
+            ) {
+                eprintln!("SKIP: rootless tmpfs unavailable, cannot exercise ENOSPC");
+            }
+            return;
+        };
+
+        let hosts = dir.join("hosts");
+        let original = "127.0.0.1 localhost localhost.localdomain\n\
+                        ::1 localhost localhost.localdomain\n\
+                        10.0.0.5 my-precious-manual-entry\n";
+        fs::write(&hosts, original).unwrap();
+
+        // Fill the filesystem to capacity so the upcoming write cannot fit,
+        // even after the old contents are released by a truncation.
+        let filler = dir.join("filler");
+        {
+            use std::io::Write as _;
+            let mut f = fs::File::create(&filler).unwrap();
+            let chunk = vec![0u8; 4096];
+            while f.write_all(&chunk).is_ok() {}
+            // Filling to capacity is the point here, so a failing flush is expected.
+            let _flushed = f.flush();
+        }
+        assert!(
+            fs::write(dir.join("probe"), vec![0u8; 8192]).is_err(),
+            "the tiny filesystem still has free space; ENOSPC will not trigger"
+        );
+
+        let sync = new_sync(hosts.clone(), true, 100);
+
+        // Enough containers that the rendered section dwarfs the free space.
+        for i in 0..150 {
+            seed_container(
+                &sync,
+                &format!("container{i}"),
+                &format!("a-fairly-long-container-name-number-{i}"),
+                &format!("172.17.{}.{}", i / 256, i % 256),
+            )
+            .await;
+        }
+
+        let result = sync.write_hosts_file_immediate().await;
+        assert!(
+            result.is_err(),
+            "the write was expected to fail with ENOSPC on the tiny filesystem"
+        );
+
+        let after = fs::read_to_string(&hosts).unwrap();
+        assert!(
+            after.contains("my-precious-manual-entry"),
+            "a failed write destroyed the user's hosts file; it is now {} bytes",
+            after.len()
+        );
+        assert!(
+            after == original,
+            "a failed write corrupted the hosts file: {} bytes now, {} before.\nIt now ends with: {:?}",
+            after.len(),
+            original.len(),
+            after.get(after.len().saturating_sub(60)..).unwrap_or("")
+        );
     }
 }
