@@ -21,6 +21,106 @@ const END_TAG: &str = "## docker-hostmanager-end";
 /// How often the event loop refreshes its liveness timestamp when Docker is quiet.
 const HEARTBEAT_SECS: u64 = 10;
 
+/// Whether the hosts file can be protected against a write failing part-way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReservationSupport {
+    /// Space can be reserved up front, so a failed write cannot damage the file.
+    /// Only reachable on Linux, the only platform offering a reservation.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Available,
+    /// No reservation is possible; only the restore-on-failure path applies.
+    Unavailable(String),
+    /// The file cannot be opened for writing at all, so *every* update will
+    /// fail. Worth reporting separately and loudly: it is a misconfiguration
+    /// rather than a weaker guarantee.
+    NotWritable(String),
+}
+
+/// Checks whether space reservation actually works for `path`.
+///
+/// This probes the real file rather than inferring from the platform, because
+/// support is a property of the *filesystem*: a Linux kernel says nothing about
+/// whether the particular filesystem under `/etc/hosts` implements `fallocate`.
+///
+/// The probe cannot disturb the file. For a non-empty file it reserves exactly
+/// the bytes already occupied, which changes neither size nor contents; for an
+/// empty one it uses `FALLOC_FL_KEEP_SIZE`, which reserves a block while leaving
+/// the file empty.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn probe_reservation_support(path: &Path) -> ReservationSupport {
+    use std::os::unix::io::AsRawFd;
+
+    let file = match fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        Err(e) => return ReservationSupport::NotWritable(e.to_string()),
+    };
+    let size = file.metadata().map_or(0, |m| m.len());
+
+    let (mode, len) = if size > 0 {
+        (0, i64::try_from(size).unwrap_or(i64::MAX))
+    } else {
+        (libc::FALLOC_FL_KEEP_SIZE, 1)
+    };
+
+    // SAFETY: `file` owns a valid open file descriptor for the whole call, and
+    // `fallocate` only inspects that descriptor and the three integer arguments.
+    let rc = unsafe { libc::fallocate(file.as_raw_fd(), mode, 0, len) };
+    if rc == 0 {
+        ReservationSupport::Available
+    } else {
+        ReservationSupport::Unavailable(std::io::Error::last_os_error().to_string())
+    }
+}
+
+/// Elsewhere there is no reservation to offer, but the writability check is
+/// still worth doing — it catches a misconfigured target at startup.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn probe_reservation_support(path: &Path) -> ReservationSupport {
+    match fs::OpenOptions::new().write(true).open(path) {
+        Ok(_) => ReservationSupport::Unavailable("only supported on Linux".to_string()),
+        Err(e) => ReservationSupport::NotWritable(e.to_string()),
+    }
+}
+
+/// Reserves `len` bytes for `file`, so a subsequent write cannot fail for want
+/// of space. Returns `Ok(false)` when no such guarantee is available, which the
+/// caller treats as a reason to proceed carefully rather than to give up.
+///
+/// Linux gets the real thing via `fallocate(2)`. This is the deployment target
+/// that matters — the daemon ships as a Linux container — and it is what makes
+/// the ENOSPC guarantee above hold.
+#[cfg(target_os = "linux")]
+fn reserve_space(file: &fs::File, len: usize) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+
+    let reserve = i64::try_from(len)
+        .map_err(|_ignored| std::io::Error::other("hosts file content too large"))?;
+
+    // SAFETY: `file` owns a valid open file descriptor for the whole call, and
+    // `fallocate` only inspects that descriptor and the three integer arguments.
+    let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, reserve) };
+    if rc == 0 {
+        return Ok(true);
+    }
+
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        // Not every filesystem implements fallocate; fall back rather than
+        // refuse to write at all.
+        Some(libc::EOPNOTSUPP | libc::ENOSYS) => Ok(false),
+        _ => Err(err),
+    }
+}
+
+/// macOS and Windows have no portable equivalent that is worth the complexity
+/// here, so they rely on the caller's restore-on-failure path instead.
+#[cfg(not(target_os = "linux"))]
+fn reserve_space(_file: &fs::File, _len: usize) -> std::io::Result<bool> {
+    Ok(false)
+}
+
 /// Writes `content` to `path` without ever leaving the file truncated, empty or
 /// half-written, restoring `previous` if the write fails once already underway.
 ///
@@ -40,12 +140,13 @@ const HEARTBEAT_SECS: u64 = 10;
 /// This replaces a `fs::write` call, which is `File::create` + `write_all` —
 /// `O_TRUNC` first, write second. On 2026-08-07 a transient ENOSPC on the host
 /// hit exactly that window and left the user's `/etc/hosts` at zero bytes.
+///
+/// The reservation is Linux-only (see [`reserve_space`]); elsewhere the
+/// restore-on-failure path below is what keeps the file consistent.
 fn write_in_place(path: &Path, content: &str, previous: &str) -> Result<()> {
     use std::io::{Seek, SeekFrom, Write};
-    use std::os::unix::io::AsRawFd;
 
     let bytes = content.as_bytes();
-    let reserve = i64::try_from(bytes.len()).context("hosts file content too large")?;
 
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -54,29 +155,22 @@ fn write_in_place(path: &Path, content: &str, previous: &str) -> Result<()> {
 
     // The step that must fail on a full filesystem, while the old contents
     // are still there. Note this deliberately does not truncate first.
-    // SAFETY: `file` owns a valid open file descriptor for the whole call, and
-    // `fallocate` only inspects the fd and the two integer arguments.
-    let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, reserve) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            // Not every filesystem implements fallocate. Rather than refuse to
-            // write at all, carry on with the weaker guarantee.
-            Some(libc::EOPNOTSUPP | libc::ENOSYS) => {
-                debug!(
-                    "fallocate unsupported on {}, writing without a space reservation",
+    match reserve_space(&file, bytes.len()) {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(
+                "No space reservation available for {}, writing without one",
+                path.display()
+            );
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "Failed to reserve {} bytes for {}; leaving it unchanged",
+                    bytes.len(),
                     path.display()
-                );
-            }
-            _ => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "Failed to reserve {} bytes for {}; leaving it unchanged",
-                        bytes.len(),
-                        path.display()
-                    )
-                });
-            }
+                )
+            });
         }
     }
 
@@ -2118,6 +2212,99 @@ mod tests {
     // bytes and killed the daemon. Three distinct defects were involved; each
     // gets a test below.
 
+    #[test]
+    fn test_probe_reservation_support_on_a_normal_file() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        let original = "127.0.0.1 localhost\n10.0.0.5 keep-me\n";
+        fs::write(&path, original).unwrap();
+
+        let support = probe_reservation_support(&path);
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                support,
+                ReservationSupport::Available,
+                "a regular file on a normal filesystem should support reservation"
+            );
+        }
+
+        // The probe must never disturb the file it is asked about.
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "probing changed the file's contents"
+        );
+    }
+
+    /// The hosts file was left at zero bytes by the incident, so the empty case
+    /// is not hypothetical: probing it must not make it non-empty.
+    #[test]
+    fn test_probe_reservation_support_leaves_an_empty_file_empty() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        fs::write(&path, "").unwrap();
+
+        let support = probe_reservation_support(&path);
+        if cfg!(target_os = "linux") {
+            assert_eq!(support, ReservationSupport::Available);
+        }
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            0,
+            "probing an empty hosts file must leave it empty"
+        );
+    }
+
+    #[test]
+    fn test_probe_reservation_support_reports_unwritable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-hosts-file");
+
+        let support = probe_reservation_support(&missing);
+        assert!(
+            matches!(support, ReservationSupport::NotWritable(_)),
+            "a file that cannot be opened for writing must be reported as such, got {support:?}"
+        );
+    }
+
+    /// A read-only target is a misconfiguration, not merely a weaker guarantee,
+    /// so it must be distinguishable from an unsupported filesystem.
+    #[test]
+    fn test_probe_reservation_support_distinguishes_read_only_target() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            perms.set_mode(0o444);
+        }
+        #[cfg(not(unix))]
+        perms.set_readonly(true);
+        fs::set_permissions(&path, perms).unwrap();
+
+        let support = probe_reservation_support(&path);
+
+        // Restore permissions so the temp file can be cleaned up.
+        let mut restore = fs::metadata(&path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            restore.set_mode(0o644);
+        }
+        #[cfg(not(unix))]
+        restore.set_readonly(false);
+        fs::set_permissions(&path, restore).unwrap();
+
+        assert!(
+            matches!(support, ReservationSupport::NotWritable(_)),
+            "a read-only hosts file must be reported as not writable, got {support:?}"
+        );
+    }
+
     fn test_container(id: &str, name: &str, ip: &str) -> ContainerInfo {
         ContainerInfo {
             id: id.to_string(),
@@ -2230,82 +2417,101 @@ mod tests {
         );
     }
 
-    /// Locates a small filesystem to exercise ENOSPC against. The test re-execs
-    /// itself inside a user namespace with a tiny tmpfs; if that is unavailable
-    /// (restricted CI sandbox, no `CONFIG_USER_NS`) the test skips cleanly.
-    fn tiny_fs_dir() -> Option<PathBuf> {
-        std::env::var("HOSTMANAGER_TINYFS").ok().map(PathBuf::from)
+    /// Byte ceiling imposed on the child process below. Small enough that the
+    /// rendered managed section cannot fit, large enough for the starting file.
+    #[cfg(target_os = "linux")]
+    const FSIZE_LIMIT: u64 = 4096;
+
+    #[cfg(target_os = "linux")]
+    const FSIZE_LIMIT_VAR: &str = "HOSTMANAGER_FSIZE_LIMIT";
+
+    /// Caps the file size this process may create, so a large write fails partway
+    /// exactly as it does on a full filesystem.
+    ///
+    /// `RLIMIT_FSIZE` is used rather than a real small filesystem because it needs
+    /// no privileges: mounting even a rootless tmpfs requires user namespaces,
+    /// which Ubuntu 23.10+ (and therefore GitHub Actions) blocks by default via
+    /// `kernel.apparmor_restrict_unprivileged_userns`. The kernel path is the same
+    /// one ENOSPC takes: `fallocate` refuses up front with `EFBIG` and leaves the
+    /// file untouched, while a plain write truncates first and fails halfway.
+    #[cfg(target_os = "linux")]
+    fn apply_fsize_limit(limit: u64) {
+        let rlimit = libc::rlimit {
+            rlim_cur: limit,
+            rlim_max: limit,
+        };
+        // SAFETY: both calls take plain scalars and a pointer to the local above,
+        // and affect only this process, which exists solely to run this one test.
+        unsafe {
+            // Exceeding the limit also raises SIGXFSZ, which would kill the
+            // process before the write could return an error to inspect.
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            libc::setrlimit(libc::RLIMIT_FSIZE, &raw const rlimit);
+        }
     }
 
-    fn reexec_in_tiny_fs(test_name: &str) -> bool {
-        let Ok(exe) = std::env::current_exe() else {
-            return false;
-        };
-        let script = "mkdir -p /tmp/tinyfs \
-             && mount -t tmpfs -o size=128k tmpfs /tmp/tinyfs \
-             && exec \"$0\" --exact \"$1\" --nocapture";
-        let output = std::process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "--mount", "sh", "-c", script])
-            .arg(exe)
-            .arg(test_name)
-            .env("HOSTMANAGER_TINYFS", "/tmp/tinyfs")
-            .output();
-
-        match output {
-            Ok(o) if o.status.success() => true,
-            Ok(o) => {
-                // Surface the inner failure; the child's output is otherwise lost.
-                let err = String::from_utf8_lossy(&o.stderr);
-                let out = String::from_utf8_lossy(&o.stdout);
-                let tail: String = out.lines().rev().take(15).collect::<Vec<_>>().join("\n");
-                panic!("ENOSPC regression test failed inside the namespace:\n{err}\n--- stdout tail ---\n{tail}");
-            }
-            Err(_) => false,
-        }
+    /// Re-runs a single test in a child process under the file size limit.
+    ///
+    /// The limit is process-wide, so it cannot be set in the test process itself
+    /// without breaking every other test writing temporary files in parallel.
+    #[cfg(target_os = "linux")]
+    fn reexec_under_fsize_limit(test_name: &str) -> std::process::Output {
+        let exe = std::env::current_exe().expect("cannot locate the test binary");
+        std::process::Command::new(exe)
+            .args(["--exact", test_name, "--nocapture"])
+            .env(FSIZE_LIMIT_VAR, FSIZE_LIMIT.to_string())
+            .output()
+            .expect("failed to re-exec the test binary")
     }
 
     /// Defect 1, the one that cost the user their `/etc/hosts`.
     ///
+    /// Linux-only: the guarantee under test comes from `fallocate(2)`, and the
+    /// harness leans on `RLIMIT_FSIZE`. Both are Linux specifics.
+    ///
     /// `fs::write` is `File::create` + `write_all`, i.e. `O_TRUNC` first and
     /// write second. When the write fails the file is already truncated, so a
-    /// transient ENOSPC leaves a zero-byte hosts file. The previous contents
-    /// must survive a failed write.
+    /// transient ENOSPC leaves a zero-byte hosts file — or, with a little space
+    /// left, one cut off mid-line. The previous contents must survive intact.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_failed_write_preserves_existing_hosts_file() {
-        let Some(dir) = tiny_fs_dir() else {
-            if !reexec_in_tiny_fs(
+        let Some(limit) = std::env::var(FSIZE_LIMIT_VAR)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            // Parent side: hand the work to a child process, because the file
+            // size limit it needs would otherwise apply to every test.
+            let output = reexec_under_fsize_limit(
                 "synchronizer::tests::test_failed_write_preserves_existing_hosts_file",
-            ) {
-                eprintln!("SKIP: rootless tmpfs unavailable, cannot exercise ENOSPC");
-            }
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "the write-safety regression failed:\n{}\n--- stdout ---\n{stdout}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // A name that no longer matches would run zero tests and still exit
+            // 0, silently turning this into a test that checks nothing.
+            assert!(
+                stdout.contains("1 passed"),
+                "the child ran no test — has this test been renamed?\n{stdout}"
+            );
             return;
         };
 
-        let hosts = dir.join("hosts");
+        apply_fsize_limit(limit);
+
+        let dir = tempfile::tempdir().unwrap();
+        let hosts = dir.path().join("hosts");
         let original = "127.0.0.1 localhost localhost.localdomain\n\
                         ::1 localhost localhost.localdomain\n\
                         10.0.0.5 my-precious-manual-entry\n";
         fs::write(&hosts, original).unwrap();
 
-        // Fill the filesystem to capacity so the upcoming write cannot fit,
-        // even after the old contents are released by a truncation.
-        let filler = dir.join("filler");
-        {
-            use std::io::Write as _;
-            let mut f = fs::File::create(&filler).unwrap();
-            let chunk = vec![0u8; 4096];
-            while f.write_all(&chunk).is_ok() {}
-            // Filling to capacity is the point here, so a failing flush is expected.
-            let _flushed = f.flush();
-        }
-        assert!(
-            fs::write(dir.join("probe"), vec![0u8; 8192]).is_err(),
-            "the tiny filesystem still has free space; ENOSPC will not trigger"
-        );
-
         let sync = new_sync(hosts.clone(), true, 100);
 
-        // Enough containers that the rendered section dwarfs the free space.
+        // Enough containers that the rendered section far exceeds the limit.
         for i in 0..150 {
             seed_container(
                 &sync,
@@ -2319,7 +2525,7 @@ mod tests {
         let result = sync.write_hosts_file_immediate().await;
         assert!(
             result.is_err(),
-            "the write was expected to fail with ENOSPC on the tiny filesystem"
+            "the write was expected to fail against the {limit} byte file size limit"
         );
 
         let after = fs::read_to_string(&hosts).unwrap();

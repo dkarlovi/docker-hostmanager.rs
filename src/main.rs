@@ -9,7 +9,7 @@ mod health;
 mod synchronizer;
 mod types;
 
-use synchronizer::Synchronizer;
+use synchronizer::{probe_reservation_support, ReservationSupport, Synchronizer};
 
 // Version from git tag at build time
 const VERSION: &str = env!("GIT_VERSION");
@@ -159,6 +159,12 @@ async fn main() -> Result<()> {
                 "{} Watch mode - displaying hostname changes only",
                 "ℹ".bright_blue()
             );
+            // No reservation line here: watch mode never writes a hosts file.
+            println!(
+                "{} Health socket: {}",
+                "ℹ".bright_blue(),
+                args.health_socket.display().to_string().bright_white()
+            );
             println!();
 
             let sync = Synchronizer::new(
@@ -215,6 +221,28 @@ async fn main() -> Result<()> {
                 "{} Sync mode - will update {}",
                 "✓".bright_green(),
                 hosts_file.display()
+            );
+            match probe_reservation_support(&hosts_file) {
+                ReservationSupport::Available => println!(
+                    "{} Space reservation active - a failed write cannot damage the file",
+                    "✓".bright_green()
+                ),
+                ReservationSupport::Unavailable(reason) => println!(
+                    "{} Space reservation unavailable ({}) - falling back to restore-on-failure",
+                    "⚠".bright_yellow(),
+                    reason.bright_white()
+                ),
+                ReservationSupport::NotWritable(reason) => println!(
+                    "{} Cannot open {} for writing ({}) - every update will fail",
+                    "✗".bright_red(),
+                    hosts_file.display(),
+                    reason.bright_white()
+                ),
+            }
+            println!(
+                "{} Health socket: {}",
+                "ℹ".bright_blue(),
+                args.health_socket.display().to_string().bright_white()
             );
             println!();
 

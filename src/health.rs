@@ -17,14 +17,21 @@
 //!
 //! Both ends are this binary, so it works in a distroless image with no shell.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::warn;
+
+#[cfg(unix)]
+use anyhow::Context;
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tracing::{debug, error, warn};
+#[cfg(unix)]
+use tracing::{debug, error};
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -64,16 +71,20 @@ impl HealthState {
         self.last_write_ok.store(ok, Ordering::Relaxed);
     }
 
+    // Only the unix health socket reads these back out.
+    #[cfg_attr(not(unix), allow(dead_code))]
     #[must_use]
     pub fn age_secs(&self) -> u64 {
         now_secs().saturating_sub(self.last_activity.load(Ordering::Relaxed))
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     #[must_use]
     pub fn write_ok(&self) -> bool {
         self.last_write_ok.load(Ordering::Relaxed)
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn report(&self) -> String {
         format!("age={} write_ok={}\n", self.age_secs(), self.write_ok())
     }
@@ -84,6 +95,7 @@ impl HealthState {
 /// A bind failure is logged and the future then parks forever rather than
 /// returning: taking the daemon down over its own health endpoint would cause
 /// exactly the kind of outage the endpoint exists to reveal.
+#[cfg(unix)]
 pub async fn serve(state: Arc<HealthState>, path: PathBuf) {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -133,10 +145,19 @@ pub async fn serve(state: Arc<HealthState>, path: PathBuf) {
     }
 }
 
+/// The health endpoint is built on unix domain sockets, which Windows lacks an
+/// equivalent of here. The daemon still runs; only the probe is unavailable.
+#[cfg(not(unix))]
+pub async fn serve(_state: Arc<HealthState>, _path: PathBuf) {
+    warn!("Health socket is not supported on this platform; probes will fail");
+    std::future::pending::<()>().await;
+}
+
 /// Queries a running instance over its health socket.
 ///
 /// Returns a human-readable summary when healthy, and an error describing the
 /// problem otherwise.
+#[cfg(unix)]
 pub async fn probe(path: &Path, max_age_secs: u64, timeout: Duration) -> Result<String> {
     let mut stream = tokio::time::timeout(timeout, UnixStream::connect(path))
         .await
@@ -175,7 +196,12 @@ pub async fn probe(path: &Path, max_age_secs: u64, timeout: Duration) -> Result<
     ))
 }
 
-#[cfg(test)]
+#[cfg(not(unix))]
+pub async fn probe(_path: &Path, _max_age_secs: u64, _timeout: Duration) -> Result<String> {
+    bail!("health probes are not supported on this platform")
+}
+
+#[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
