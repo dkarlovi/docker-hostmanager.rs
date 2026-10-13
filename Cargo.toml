@@ -2,7 +2,7 @@
 name = "docker-hostmanager"
 version = "0.1.0"
 edition = "2021"
-authors = ["Dalibor Karlović <dalibor@flexolabs.io>"]
+authors = ["Dalibor Karlović <dalibor.karlovic@sigwin.hr>"]
 description = "Automatically update /etc/hosts with Docker container hostnames"
 repository = "https://github.com/dkarlovi/docker-hostmanager.rs"
 license = "MIT"

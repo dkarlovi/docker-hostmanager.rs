@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,11 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0  # Fetch all history and tags for version info
-      - uses: dtolnay/rust-toolchain@stable
+          fetch-depth: 0 # Fetch all history and tags for version info
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - uses: Swatinem/rust-cache@v2
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --frozen --verbose
 
   clippy:
     name: Clippy
@@ -28,13 +31,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0  # Fetch all history and tags for version info
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+          fetch-depth: 0 # Fetch all history and tags for version info
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - uses: Swatinem/rust-cache@v2
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --frozen --all-targets --all-features -- -D warnings
 
   fmt:
     name: Rustfmt
@@ -42,10 +46,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0  # Fetch all history and tags for version info
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+          fetch-depth: 0 # Fetch all history and tags for version info
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -55,8 +58,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0  # Fetch all history and tags for version info
-      - uses: dtolnay/rust-toolchain@stable
+          fetch-depth: 0 # Fetch all history and tags for version info
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - uses: Swatinem/rust-cache@v2
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
       - name: Build
-        run: cargo build --release --verbose
+        run: cargo build --frozen --release --verbose

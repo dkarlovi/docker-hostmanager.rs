@@ -1,5 +1,16 @@
 version: 2
 updates:
+  - package-ecosystem: "rust-toolchain"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "dependencies"
+      - "dependabot"
+
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -14,7 +25,7 @@ updates:
       all-dependencies:
         patterns:
           - "*"
-  
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -29,7 +40,7 @@ updates:
       all-actions:
         patterns:
           - "*"
-  
+
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
