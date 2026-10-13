@@ -46,9 +46,10 @@ jobs:
           fetch-depth: 0  # Fetch all history and tags for version info
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+        shell: bash
+        run: |
+          rustup show
+          rustup target add "${{ matrix.target }}"
       
       - name: Install cosign
         uses: sigstore/cosign-installer@v3

@@ -1,10 +1,12 @@
-FROM rust:1.98.1-slim AS chef
-RUN rustup target add x86_64-unknown-linux-musl && \
+FROM rust:slim AS chef
+WORKDIR /usr/src/app
+COPY rust-toolchain.toml ./
+RUN rustup show && \
+    rustup target add x86_64-unknown-linux-musl && \
     rustup target add aarch64-unknown-linux-musl && \
     apt-get update && apt-get install -y musl-tools gcc-aarch64-linux-gnu && \
     cargo install cargo-chef --version '=0.1.78' --locked && \
     cargo install cargo-auditable --version '=0.7.7' --locked
-WORKDIR /usr/src/app
 
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock build.rs ./
