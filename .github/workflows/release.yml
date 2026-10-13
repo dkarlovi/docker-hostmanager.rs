@@ -3,17 +3,17 @@ name: Release
 on:
   push:
     tags:
-      - '*.*.*'
+      - "*.*.*"
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g., 1.0.0)'
+        description: "Tag to release (e.g., 1.0.0)"
         required: true
         type: string
 
 permissions:
   contents: write
-  id-token: write  # Required for cosign signing
+  id-token: write # Required for cosign signing
 
 jobs:
   build-and-upload:
@@ -43,14 +43,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          fetch-depth: 0  # Fetch all history and tags for version info
+          fetch-depth: 0 # Fetch all history and tags for version info
 
       - name: Install Rust
         shell: bash
         run: |
           rustup show
           rustup target add "${{ matrix.target }}"
-      
+
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
@@ -73,7 +73,7 @@ jobs:
         run: |
           VERSION="${{ github.event.inputs.tag || github.ref_name }}"
           ARCHIVE="docker-hostmanager-${VERSION}-${{ matrix.build }}"
-          
+
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp "target/${{ matrix.target }}/release/docker-hostmanager.exe" "docker-hostmanager.exe"
             7z a "${ARCHIVE}.zip" "docker-hostmanager.exe" README.md
@@ -91,14 +91,14 @@ jobs:
         with:
           name: ${{ matrix.build }}
           path: ${{ env.ASSET }}
-      
+
       - name: Sign archive with cosign
         shell: bash
         run: |
           cosign sign-blob --yes \
             --bundle ${{ env.ASSET }}.sigstore.json \
             ${{ env.ASSET }}
-      
+
       - name: Upload signature bundle
         uses: actions/upload-artifact@v7
         with:
@@ -126,13 +126,13 @@ jobs:
         run: |
           # Get the previous tag
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          
+
           if [ -z "$PREV_TAG" ]; then
             CHANGELOG=$(git log --pretty=format:"* %s (%h)" --no-merges)
           else
             CHANGELOG=$(git log ${PREV_TAG}..HEAD --pretty=format:"* %s (%h)" --no-merges | grep -v '^* deps:' | grep -v '^* chore:' | grep -v '^* docs:' || echo "No significant changes")
           fi
-          
+
           echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
           echo "$CHANGELOG" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -144,15 +144,15 @@ jobs:
           body: |
             ## Changes
             ${{ steps.changelog.outputs.CHANGELOG }}
-            
+
             ## Installation
-            
+
             Download the appropriate archive for your platform and extract it.
-            
+
             ## Verification
-            
+
             All release artifacts are signed with [cosign](https://github.com/sigstore/cosign). To verify:
-            
+
             ```bash
             # Download the artifact and its .sigstore.json bundle
             # Then verify with:
@@ -162,11 +162,11 @@ jobs:
               --bundle <artifact>.sigstore.json \
               <artifact>
             ```
-            
+
             ### Docker
-            
+
             Docker images are also signed and can be verified:
-            
+
             ```bash
             cosign verify \
               --certificate-identity-regexp 'https://github.com/dkarlovi/docker-hostmanager.rs' \
@@ -175,7 +175,7 @@ jobs:
             ```
 
             Run with:
-            
+
             ```bash
             docker run -d \
               --name docker-hostmanager \

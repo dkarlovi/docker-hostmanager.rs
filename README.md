@@ -7,7 +7,7 @@ A Rust implementation of Docker Host Manager - automatically update `/etc/hosts`
 - 🚀 **Event-driven**: Listens to Docker events and updates hosts file in real-time
 - 🔌 **Socket support**: Connects to Docker Engine via Unix socket
 - 🌐 **Network-aware**: Supports Docker networks with proper hostname resolution
-- 🏷️ **Flexible naming**: 
+- 🏷️ **Flexible naming**:
   - Container name + network name (e.g., `web.myapp`)
   - Network aliases
   - Custom domains via `DOMAIN_NAME` environment variable
@@ -164,7 +164,7 @@ The tool generates hostnames based on container configuration:
 ### Example docker-compose.yml
 
 ```yaml
-version: '3.5'
+version: "3.5"
 
 networks:
   myapp:
@@ -191,6 +191,7 @@ services:
 ```
 
 This will create the following hosts entries:
+
 ```
 # In /etc/hosts:
 ## docker-hostmanager-start

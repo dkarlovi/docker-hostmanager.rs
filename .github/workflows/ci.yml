@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0  # Fetch all history and tags for version info
+          fetch-depth: 0 # Fetch all history and tags for version info
       - name: Install pinned Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0  # Fetch all history and tags for version info
+          fetch-depth: 0 # Fetch all history and tags for version info
       - name: Install pinned Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -46,7 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0  # Fetch all history and tags for version info
+          fetch-depth: 0 # Fetch all history and tags for version info
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Check formatting
@@ -58,7 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0  # Fetch all history and tags for version info
+          fetch-depth: 0 # Fetch all history and tags for version info
       - name: Install pinned Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
