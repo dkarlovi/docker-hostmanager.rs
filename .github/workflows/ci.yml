@@ -40,6 +40,36 @@ jobs:
       - name: Run clippy
         run: cargo clippy --frozen --all-targets --all-features -- -D warnings
 
+  mutants:
+    name: Mutation testing (changed lines)
+    # Mutates only the lines this PR touches, so it stays fast; a mutant that
+    # survives means the change has code no test would notice breaking.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # Fetch all history and tags for version info
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@27.1.0
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Diff against the base branch
+        run: git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
+      - name: Run cargo-mutants on the diff
+        # Two jobs suit the 4-vCPU hosted runners; each job builds its own copy.
+        run: cargo mutants --no-shuffle --jobs 2 --in-diff pr.diff
+      - name: Upload mutants report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants.out
+          path: mutants.out
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
