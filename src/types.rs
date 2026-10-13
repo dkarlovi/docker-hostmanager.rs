@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerInfo {
     pub id: String,
     pub name: String,
     pub ip_address: Option<String>,
-    pub networks: HashMap<String, NetworkInfo>,
+    pub networks: BTreeMap<String, NetworkInfo>,
     pub domain_names: Vec<String>,
     pub running: bool,
 }
@@ -76,11 +76,10 @@ impl ContainerInfo {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
+#[expect(
     clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    reason = "tests should fail loudly"
 )]
 mod tests {
     use super::*;
@@ -91,7 +90,7 @@ mod tests {
             id: "abc123".to_string(),
             name: "test".to_string(),
             ip_address: Some("172.17.0.2".to_string()),
-            networks: HashMap::new(),
+            networks: BTreeMap::new(),
             domain_names: vec![],
             running: true,
         };
@@ -101,7 +100,7 @@ mod tests {
             id: "abc123".to_string(),
             name: "test".to_string(),
             ip_address: Some("172.17.0.2".to_string()),
-            networks: HashMap::new(),
+            networks: BTreeMap::new(),
             domain_names: vec![],
             running: false,
         };
@@ -111,7 +110,7 @@ mod tests {
             id: "abc123".to_string(),
             name: "test".to_string(),
             ip_address: None,
-            networks: HashMap::new(),
+            networks: BTreeMap::new(),
             domain_names: vec![],
             running: true,
         };
@@ -124,7 +123,7 @@ mod tests {
             id: "abc123".to_string(),
             name: "nginx".to_string(),
             ip_address: Some("172.17.0.2".to_string()),
-            networks: HashMap::new(),
+            networks: BTreeMap::new(),
             domain_names: vec![],
             running: true,
         };
@@ -141,7 +140,7 @@ mod tests {
             id: "abc123".to_string(),
             name: "web".to_string(),
             ip_address: Some("172.17.0.2".to_string()),
-            networks: HashMap::new(),
+            networks: BTreeMap::new(),
             domain_names: vec!["example.com".to_string(), "www.example.com".to_string()],
             running: true,
         };
@@ -156,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_get_hostnames_with_network() {
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "myapp".to_string(),
             NetworkInfo {
@@ -183,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_get_hostnames_with_network_specific_domain() {
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "myapp".to_string(),
             NetworkInfo {
@@ -214,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_get_hostnames_with_default_network_domains() {
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "urq_default".to_string(), // Full network name from Docker
             NetworkInfo {
@@ -248,7 +247,7 @@ mod tests {
     #[test]
     fn test_network_name_matching_with_underscore_suffix() {
         // Test that "default" matches "project_default"
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "myproject_default".to_string(),
             NetworkInfo {
@@ -277,7 +276,7 @@ mod tests {
     #[test]
     fn test_network_name_matching_with_hyphen_suffix() {
         // Test that "default" matches "project-default"
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "stack-default".to_string(),
             NetworkInfo {
@@ -306,7 +305,7 @@ mod tests {
     #[test]
     fn test_network_name_exact_match_takes_precedence() {
         // Test that exact match works when network is actually named "default"
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "default".to_string(),
             NetworkInfo {
@@ -335,7 +334,7 @@ mod tests {
     #[test]
     fn test_network_name_no_false_positives() {
         // Test that "default" doesn't match "mydefault" or "default_app"
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "mydefault".to_string(),
             NetworkInfo {
@@ -364,7 +363,7 @@ mod tests {
     #[test]
     fn test_multiple_networks_with_domain_name_matching() {
         // Test container in multiple networks with DOMAIN_NAME targeting specific ones
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "frontend_default".to_string(),
             NetworkInfo {
@@ -418,7 +417,7 @@ mod tests {
 
     #[test]
     fn test_get_hostnames_multiple_networks() {
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "frontend".to_string(),
             NetworkInfo {
@@ -454,7 +453,7 @@ mod tests {
 
     #[test]
     fn test_get_hostnames_deduplicates() {
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "urq_default".to_string(),
             NetworkInfo {

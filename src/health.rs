@@ -72,19 +72,28 @@ impl HealthState {
     }
 
     // Only the unix health socket reads these back out.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "only the unix health socket reads this")
+    )]
     #[must_use]
     pub fn age_secs(&self) -> u64 {
         now_secs().saturating_sub(self.last_activity.load(Ordering::Relaxed))
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "only the unix health socket reads this")
+    )]
     #[must_use]
     pub fn write_ok(&self) -> bool {
         self.last_write_ok.load(Ordering::Relaxed)
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "only the unix health socket reads this")
+    )]
     fn report(&self) -> String {
         format!("age={} write_ok={}\n", self.age_secs(), self.write_ok())
     }
@@ -96,6 +105,10 @@ impl HealthState {
 /// returning: taking the daemon down over its own health endpoint would cause
 /// exactly the kind of outage the endpoint exists to reveal.
 #[cfg(unix)]
+#[expect(
+    clippy::infinite_loop,
+    reason = "the socket is served for the lifetime of the process"
+)]
 pub async fn serve(state: Arc<HealthState>, path: PathBuf) {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -202,7 +215,12 @@ pub async fn probe(_path: &Path, _max_age_secs: u64, _timeout: Duration) -> Resu
 }
 
 #[cfg(all(test, unix))]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests should fail loudly"
+)]
 mod tests {
     use super::*;
 

@@ -3,7 +3,7 @@ use bollard::models::{ContainerInspectResponse, EventActor, EventMessage, EventM
 use bollard::query_parameters::{EventsOptions, InspectContainerOptions, ListContainersOptions};
 use bollard::Docker;
 use colored::Colorize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,7 +26,10 @@ const HEARTBEAT_SECS: u64 = 10;
 pub enum ReservationSupport {
     /// Space can be reserved up front, so a failed write cannot damage the file.
     /// Only reachable on Linux, the only platform offering a reservation.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only constructed by the Linux reservation probe")
+    )]
     Available,
     /// No reservation is possible; only the restore-on-failure path applies.
     Unavailable(String),
@@ -63,6 +66,7 @@ pub fn probe_reservation_support(path: &Path) -> ReservationSupport {
         (libc::FALLOC_FL_KEEP_SIZE, 1)
     };
 
+    #[expect(unsafe_code, reason = "fallocate(2) has no safe wrapper in libc")]
     // SAFETY: `file` owns a valid open file descriptor for the whole call, and
     // `fallocate` only inspects that descriptor and the three integer arguments.
     let rc = unsafe { libc::fallocate(file.as_raw_fd(), mode, 0, len) };
@@ -98,6 +102,7 @@ fn reserve_space(file: &fs::File, len: usize) -> std::io::Result<bool> {
     let reserve = i64::try_from(len)
         .map_err(|_ignored| std::io::Error::other("hosts file content too large"))?;
 
+    #[expect(unsafe_code, reason = "fallocate(2) has no safe wrapper in libc")]
     // SAFETY: `file` owns a valid open file descriptor for the whole call, and
     // `fallocate` only inspects that descriptor and the three integer arguments.
     let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, reserve) };
@@ -178,7 +183,7 @@ fn write_in_place(path: &Path, content: &str, previous: &str) -> Result<()> {
         file.seek(SeekFrom::Start(0))?;
         file.write_all(data)?;
         // Trim whatever the previous, longer contents left behind.
-        file.set_len(data.len() as u64)?;
+        file.set_len(u64::try_from(data.len()).map_err(std::io::Error::other)?)?;
         file.sync_all()
     };
 
@@ -215,7 +220,7 @@ pub struct Synchronizer {
     tld: String,
     write_enabled: bool,
     debounce_ms: u64,
-    active_containers: Arc<Mutex<HashMap<String, ContainerInfo>>>,
+    active_containers: Arc<Mutex<BTreeMap<String, ContainerInfo>>>,
     /// Maps each hostname to the (`container_id`, `container_name`) of the first claimant.
     /// Dynamic network-alias hostnames are also tracked here; they just never conflict
     /// because they always include a unique network name.
@@ -238,7 +243,7 @@ impl Synchronizer {
             tld,
             write_enabled,
             debounce_ms,
-            active_containers: Arc::new(Mutex::new(HashMap::new())),
+            active_containers: Arc::new(Mutex::new(BTreeMap::new())),
             hostname_claims: Arc::new(Mutex::new(HashMap::new())),
             write_notify: Notify::new(),
             health: Arc::new(HealthState::new()),
@@ -401,6 +406,10 @@ impl Synchronizer {
     /// pass without a single container event. Because the runtime is
     /// `current_thread`, this stops advancing the moment anything blocks the
     /// event loop, which is exactly what the health probe needs to see.
+    #[expect(
+        clippy::infinite_loop,
+        reason = "runs until the surrounding select! drops it"
+    )]
     async fn mark_alive(&self) -> Result<()> {
         let mut ticker = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
         loop {
@@ -568,28 +577,27 @@ impl Synchronizer {
             return None;
         }
 
-        let mut networks = HashMap::new();
-        if let Some(nets) = network_settings.networks {
-            for (network_name, network) in nets {
-                if let Some(ip) = network.ip_address {
-                    if !ip.is_empty() {
-                        let mut aliases = network.aliases.unwrap_or_default();
-                        // Always include the container name as an alias
-                        if !aliases.contains(&name) {
-                            aliases.push(name.clone());
-                        }
-
-                        networks.insert(
-                            network_name,
-                            NetworkInfo {
-                                ip_address: ip,
-                                aliases,
-                            },
-                        );
-                    }
+        let networks: BTreeMap<String, NetworkInfo> = network_settings
+            .networks
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(network_name, network)| {
+                let ip = network.ip_address.filter(|ip| !ip.is_empty())?;
+                let mut aliases = network.aliases.unwrap_or_default();
+                // Always include the container name as an alias
+                if !aliases.contains(&name) {
+                    aliases.push(name.clone());
                 }
-            }
-        }
+
+                Some((
+                    network_name,
+                    NetworkInfo {
+                        ip_address: ip,
+                        aliases,
+                    },
+                ))
+            })
+            .collect();
 
         // Build variables map from environment variables and specific labels
         let mut vars = HashMap::new();
@@ -802,14 +810,14 @@ impl Synchronizer {
 
     async fn write_hosts_file_immediate(&self) -> Result<()> {
         // Snapshot both maps so we don't hold locks during file I/O.
-        let active_containers: HashMap<String, ContainerInfo> =
+        let active_containers: BTreeMap<String, ContainerInfo> =
             self.active_containers.lock().await.clone();
         let claims: HashMap<String, (String, String)> = self.hostname_claims.lock().await.clone();
 
         // Build new hosts entries, filtering out hostnames claimed by other containers.
         let mut host_entries_with_ip = Vec::new();
-        let mut container_count = 0;
-        let mut hostname_count = 0;
+        let container_count = active_containers.len();
+        let mut hostname_count: usize = 0;
 
         for (container_id, container) in &active_containers {
             let hostnames = container.get_hostnames(&self.tld);
@@ -854,11 +862,9 @@ impl Synchronizer {
                         ip.clone(),
                         format!("{} {}{}", ip, kept.join(" "), skip_comment),
                     ));
-                    hostname_count += kept.len();
+                    hostname_count = hostname_count.saturating_add(kept.len());
                 }
             }
-
-            container_count += 1;
         }
 
         host_entries_with_ip.sort_by(|a, b| a.0.cmp(&b.0));
@@ -929,12 +935,10 @@ impl Synchronizer {
                 }
                 // Note: if host_entries is empty, we don't add the tags (removes empty section)
 
-                if end + 1 < lines.len() {
-                    if let Some(after_managed) = lines.get(end + 1..) {
-                        preserved.extend(after_managed.iter().copied());
-                        new_lines
-                            .extend(after_managed.iter().map(std::string::ToString::to_string));
-                    }
+                // Everything after the end tag, which is itself skipped.
+                if let Some(after_managed) = lines.get(end..).and_then(|rest| rest.get(1..)) {
+                    preserved.extend(after_managed.iter().copied());
+                    new_lines.extend(after_managed.iter().map(std::string::ToString::to_string));
                 }
             }
             _ => {
@@ -992,11 +996,10 @@ impl Synchronizer {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
+    reason = "tests should fail loudly"
 )]
 mod tests {
     use super::*;
@@ -1023,7 +1026,7 @@ mod tests {
                     id: "test123".to_string(),
                     name: "nginx".to_string(),
                     ip_address: Some("172.17.0.2".to_string()),
-                    networks: HashMap::new(),
+                    networks: BTreeMap::new(),
                     domain_names: vec![],
                     running: true,
                 },
@@ -1057,7 +1060,7 @@ mod tests {
         let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
 
         // Add a test container
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "testnet".to_string(),
             NetworkInfo {
@@ -1088,6 +1091,61 @@ mod tests {
         assert!(content.contains("192.168.1.1 server"));
         assert!(content.contains("172.18.0.2 web.testnet"));
         assert!(!content.contains("172.17.0.2 old.container"));
+    }
+
+    #[tokio::test]
+    async fn test_write_hosts_file_order_is_stable_for_shared_ip() {
+        // On the default bridge, a container's global IP equals its network IP,
+        // so several lines share one IP and only map ordering decides between them.
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
+
+        let networks = ["foxtrot", "echo", "delta", "charlie", "bravo", "alpha"]
+            .into_iter()
+            .map(|net| {
+                (
+                    net.to_string(),
+                    NetworkInfo {
+                        ip_address: "172.17.0.2".to_string(),
+                        aliases: vec![],
+                    },
+                )
+            })
+            .collect();
+        sync.active_containers.lock().await.insert(
+            "test123".to_string(),
+            ContainerInfo {
+                id: "test123".to_string(),
+                name: "web".to_string(),
+                ip_address: Some("172.17.0.2".to_string()),
+                networks,
+                domain_names: vec![],
+                running: true,
+            },
+        );
+
+        sync.write_hosts_file_immediate().await.unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content,
+            format!(
+                "127.0.0.1 localhost\n\n{START_TAG}\n\
+                 172.17.0.2 web.docker\n\
+                 172.17.0.2 web.alpha\n\
+                 172.17.0.2 web.bravo\n\
+                 172.17.0.2 web.charlie\n\
+                 172.17.0.2 web.delta\n\
+                 172.17.0.2 web.echo\n\
+                 172.17.0.2 web.foxtrot\n\
+                 {END_TAG}\n"
+            ),
+            "lines sharing an IP must come out in a stable order"
+        );
     }
 
     #[tokio::test]
@@ -1152,7 +1210,7 @@ mod tests {
         let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
 
         // Add a test container
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             "testnet".to_string(),
             NetworkInfo {
@@ -1427,7 +1485,7 @@ mod tests {
                 id: id.to_string(),
                 name: name.to_string(),
                 ip_address: Some(ip.to_string()),
-                networks: HashMap::new(),
+                networks: BTreeMap::new(),
                 domain_names: vec![],
                 running: true,
             },
@@ -1584,7 +1642,7 @@ mod tests {
             id: "aaa".to_string(),
             name: "container-a".to_string(),
             ip_address: Some("172.17.0.2".to_string()),
-            networks: HashMap::new(),
+            networks: BTreeMap::new(),
             domain_names: vec!["myapp.local".to_string()],
             running: true,
         };
@@ -1595,7 +1653,7 @@ mod tests {
             id: "bbb".to_string(),
             name: "container-b".to_string(),
             ip_address: Some("172.17.0.3".to_string()),
-            networks: HashMap::new(),
+            networks: BTreeMap::new(),
             domain_names: vec!["myapp.local".to_string()],
             running: true,
         };
@@ -1646,7 +1704,7 @@ mod tests {
             id: "aaa".to_string(),
             name: "container-a".to_string(),
             ip_address: Some("172.17.0.2".to_string()),
-            networks: HashMap::new(),
+            networks: BTreeMap::new(),
             domain_names: vec!["shared.local".to_string()],
             running: true,
         };
@@ -1654,7 +1712,7 @@ mod tests {
             id: "bbb".to_string(),
             name: "container-b".to_string(),
             ip_address: Some("172.17.0.3".to_string()),
-            networks: HashMap::new(),
+            networks: BTreeMap::new(),
             domain_names: vec!["shared.local".to_string()],
             running: true,
         };
@@ -1700,7 +1758,7 @@ mod tests {
             id: "aaa".to_string(),
             name: "container-a".to_string(),
             ip_address: Some("172.17.0.2".to_string()),
-            networks: HashMap::new(),
+            networks: BTreeMap::new(),
             domain_names: vec!["myapp.local".to_string()],
             running: true,
         };
@@ -1718,7 +1776,7 @@ mod tests {
             id: "bbb".to_string(),
             name: "container-b".to_string(),
             ip_address: Some("172.17.0.3".to_string()),
-            networks: HashMap::new(),
+            networks: BTreeMap::new(),
             domain_names: vec!["myapp.local".to_string()],
             running: true,
         };
@@ -1754,7 +1812,7 @@ mod tests {
         let docker = Docker::connect_with_socket_defaults().unwrap();
         let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
 
-        let mut networks_a = HashMap::new();
+        let mut networks_a = BTreeMap::new();
         networks_a.insert(
             "frontend".to_string(),
             NetworkInfo {
@@ -1762,7 +1820,7 @@ mod tests {
                 aliases: vec!["web".to_string()],
             },
         );
-        let mut networks_b = HashMap::new();
+        let mut networks_b = BTreeMap::new();
         networks_b.insert(
             "backend".to_string(),
             NetworkInfo {
@@ -1828,7 +1886,7 @@ mod tests {
                 id: "aaa".to_string(),
                 name: "clash-app".to_string(),
                 ip_address: Some("172.17.0.2".to_string()),
-                networks: HashMap::new(),
+                networks: BTreeMap::new(),
                 domain_names: vec!["clash.local".to_string()],
                 running: true,
             },
@@ -1843,7 +1901,7 @@ mod tests {
                 id: "bbb".to_string(),
                 name: "clash-app".to_string(),
                 ip_address: Some("172.17.0.99".to_string()),
-                networks: HashMap::new(),
+                networks: BTreeMap::new(),
                 domain_names: vec!["clash.local".to_string()],
                 running: true,
             },
@@ -1887,7 +1945,7 @@ mod tests {
                 id: "ccc".to_string(),
                 name: "app".to_string(),
                 ip_address: Some("172.18.0.5".to_string()),
-                networks: HashMap::new(),
+                networks: BTreeMap::new(),
                 domain_names: vec![
                     "{APP_SECRET_FILE}.app2.local".to_string(),
                     "valid.local".to_string(),
@@ -1927,7 +1985,7 @@ mod tests {
                 id: "ccc".to_string(),
                 name: "c-app".to_string(),
                 ip_address: Some("172.17.0.2".to_string()),
-                networks: HashMap::new(),
+                networks: BTreeMap::new(),
                 domain_names: vec![],
                 running: true,
             },
@@ -1941,7 +1999,7 @@ mod tests {
                 id: "aaa".to_string(),
                 name: "a-app".to_string(),
                 ip_address: Some("10.0.0.2".to_string()),
-                networks: HashMap::new(),
+                networks: BTreeMap::new(),
                 domain_names: vec![],
                 running: true,
             },
@@ -1955,7 +2013,7 @@ mod tests {
                 id: "bbb".to_string(),
                 name: "b-app".to_string(),
                 ip_address: Some("10.0.0.1".to_string()),
-                networks: HashMap::new(),
+                networks: BTreeMap::new(),
                 domain_names: vec![],
                 running: true,
             },
@@ -2009,7 +2067,7 @@ mod tests {
         public_ip: &str,
         dev_domain: &str,
     ) -> ContainerInfo {
-        let mut networks = HashMap::new();
+        let mut networks = BTreeMap::new();
         networks.insert(
             default_net.to_string(),
             NetworkInfo {
@@ -2310,7 +2368,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             ip_address: Some(ip.to_string()),
-            networks: HashMap::new(),
+            networks: BTreeMap::new(),
             domain_names: vec![],
             running: true,
         }
@@ -2435,17 +2493,25 @@ mod tests {
     /// one ENOSPC takes: `fallocate` refuses up front with `EFBIG` and leaves the
     /// file untouched, while a plain write truncates first and fails halfway.
     #[cfg(target_os = "linux")]
+    #[expect(
+        unsafe_code,
+        reason = "signal(2) and setrlimit(2) have no safe wrappers in libc"
+    )]
     fn apply_fsize_limit(limit: u64) {
         let rlimit = libc::rlimit {
             rlim_cur: limit,
             rlim_max: limit,
         };
-        // SAFETY: both calls take plain scalars and a pointer to the local above,
-        // and affect only this process, which exists solely to run this one test.
+        // Exceeding the limit also raises SIGXFSZ, which would kill the
+        // process before the write could return an error to inspect.
+        // SAFETY: takes plain scalars and affects only this process, which
+        // exists solely to run this one test.
         unsafe {
-            // Exceeding the limit also raises SIGXFSZ, which would kill the
-            // process before the write could return an error to inspect.
             libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        }
+        // SAFETY: takes a scalar and a pointer to the local above, and affects
+        // only this process, which exists solely to run this one test.
+        unsafe {
             libc::setrlimit(libc::RLIMIT_FSIZE, &raw const rlimit);
         }
     }

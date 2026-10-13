@@ -28,6 +28,9 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 
+[lints.rust]
+unsafe_code = "warn"
+
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
@@ -68,6 +71,13 @@ unneeded_field_pattern = "warn"
 unreachable = "warn"
 use_debug = "warn"
 verbose_file_reads = "warn"
+iter_over_hash_type = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+as_conversions = "warn"
+arithmetic_side_effects = "warn"
+multiple_unsafe_ops_per_block = "warn"
+infinite_loop = "warn"
 
 # Allow for CLI apps (would warn in libraries)
 print_stdout = "allow"
