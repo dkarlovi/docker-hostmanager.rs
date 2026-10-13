@@ -61,7 +61,8 @@ jobs:
       - name: Diff against the base branch
         run: git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
       - name: Run cargo-mutants on the diff
-        run: cargo mutants --no-shuffle --in-diff pr.diff
+        # Two jobs suit the 4-vCPU hosted runners; each job builds its own copy.
+        run: cargo mutants --no-shuffle --jobs 2 --in-diff pr.diff
       - name: Upload mutants report
         if: failure()
         uses: actions/upload-artifact@v7

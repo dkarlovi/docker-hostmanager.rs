@@ -272,6 +272,23 @@ fn user_lines<'a>(lines: &[&'a str]) -> Vec<&'a str> {
         .collect()
 }
 
+/// The line printed after the hosts file was rewritten.
+fn write_summary(has_section: bool, container_count: usize, hostname_count: usize) -> String {
+    if has_section {
+        format!(
+            "{} Updated hosts file: {} containers, {} hostnames",
+            "✓".bright_green(),
+            container_count.to_string().bright_white(),
+            hostname_count.to_string().bright_white()
+        )
+    } else {
+        format!(
+            "{} Removed empty managed section from hosts file",
+            "✓".bright_green()
+        )
+    }
+}
+
 /// The first line of `preserved` that `rendered` no longer contains, if any.
 fn first_dropped_line<'a>(preserved: &[&'a str], rendered: &[String]) -> Option<&'a str> {
     preserved
@@ -300,6 +317,8 @@ fn is_hosts_file_safe(name: &str) -> bool {
 pub enum WriteOutcome {
     /// The file was rewritten with new contents.
     Written,
+    /// No entries were left, so the managed section was removed.
+    Removed,
     /// The file already had the desired contents, so it was left alone.
     Unchanged,
     /// Watch mode: entries were displayed, never written.
@@ -420,11 +439,7 @@ impl Synchronizer {
             }
 
             match self.inspect_container_with_start_time(&id).await {
-                Ok((started_at, Some(info))) => {
-                    if info.is_routable() {
-                        inspected.push((started_at, id, info));
-                    }
-                }
+                Ok((started_at, Some(info))) => inspected.push((started_at, id, info)),
                 Ok((_, None)) => {}
                 Err(e) => {
                     warn!("Failed to inspect container {}: {}", id, e);
@@ -610,9 +625,6 @@ impl Synchronizer {
 
     async fn handle_container_up(&self, container_id: &str) -> Result<()> {
         if let Some(info) = self.inspect_container(container_id).await? {
-            if !info.is_routable() {
-                return Ok(());
-            }
             let short_actor_id = short_id(container_id);
             println!(
                 "{} Container {} ({})",
@@ -664,16 +676,14 @@ impl Synchronizer {
         // Refresh container state from Docker so subsequent reconnects see the
         // current network set. If the container is gone or no longer exposes
         // anything, treat as a full down event.
-        match self.inspect_container(container_id).await {
-            Ok(Some(refreshed)) if refreshed.is_routable() => {
-                let mut active = self.active_containers.lock().await;
-                active.insert(container_id.to_string(), refreshed);
-            }
-            _ => {
-                let mut active = self.active_containers.lock().await;
-                active.remove(container_id);
-            }
+        let refreshed = self.inspect_container(container_id).await;
+        let mut active = self.active_containers.lock().await;
+        if let Ok(Some(info)) = refreshed {
+            active.insert(container_id.to_string(), info);
+        } else {
+            active.remove(container_id);
         }
+        drop(active);
 
         self.schedule_write();
     }
@@ -776,6 +786,8 @@ impl Synchronizer {
 
     /// Like `inspect_container` but also returns the container's `started_at` timestamp,
     /// used in `synchronize()` to sort containers before claiming hostnames.
+    ///
+    /// The info is `None` when the container should get no hosts entries.
     async fn inspect_container_with_start_time(
         &self,
         id: &str,
@@ -786,7 +798,10 @@ impl Synchronizer {
             .await
             .context("Failed to inspect container")?;
         let started_at = container.state.as_ref().and_then(|s| s.started_at.clone());
-        Ok((started_at, extract_container_info(container)))
+        // The one place routability is decided: a container we cannot address
+        // gets no hosts entries, wherever it was inspected from.
+        let info = extract_container_info(container).filter(ContainerInfo::is_routable);
+        Ok((started_at, info))
     }
 
     async fn write_hosts_file_immediate(&self) -> Result<WriteOutcome> {
@@ -867,6 +882,9 @@ impl Synchronizer {
             .into_iter()
             .map(|(_, line)| line)
             .collect();
+        // Whether a managed section will exist after this write; containers
+        // whose names were all dropped as invalid contribute no lines.
+        let has_section = !host_entries.is_empty();
 
         // Display the output
         println!();
@@ -982,21 +1000,16 @@ impl Synchronizer {
 
         write_in_place(&self.hosts_file, &new_content, &content)?;
 
-        if container_count == 0 {
-            println!(
-                "{} Removed empty managed section from hosts file",
-                "✓".bright_green()
-            );
-        } else {
-            println!(
-                "{} Updated hosts file: {} containers, {} hostnames",
-                "✓".bright_green(),
-                container_count.to_string().bright_white(),
-                hostname_count.to_string().bright_white()
-            );
-        }
+        println!(
+            "{}",
+            write_summary(has_section, container_count, hostname_count)
+        );
 
-        Ok(WriteOutcome::Written)
+        Ok(if has_section {
+            WriteOutcome::Written
+        } else {
+            WriteOutcome::Removed
+        })
     }
 }
 
@@ -1024,11 +1037,9 @@ fn extract_container_info(container: ContainerInspectResponse) -> Option<Contain
         .into_iter()
         .filter_map(|(network_name, network)| {
             let ip = network.ip_address.filter(|ip| !ip.is_empty())?;
-            let mut aliases = network.aliases.unwrap_or_default();
-            // Always include the container name as an alias
-            if !aliases.contains(&name) {
-                aliases.push(name.clone());
-            }
+            // No need to add the container name here: `get_hostnames` always
+            // emits `{name}.{network}` ahead of the aliases.
+            let aliases = network.aliases.unwrap_or_default();
 
             Some((
                 network_name,
@@ -1739,6 +1750,73 @@ mod tests {
 
         assert!(reserve_space(file.as_file(), 4096).unwrap());
         assert_eq!(file.as_file().metadata().unwrap().len(), 4096);
+    }
+
+    #[tokio::test]
+    async fn test_write_reports_removed_section_when_no_entries_remain() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        fs::write(
+            &path,
+            format!("127.0.0.1 localhost\n{START_TAG}\n172.18.0.2 old.net\n{END_TAG}\n"),
+        )
+        .unwrap();
+        // One container, but its only extra name is invalid and its network-less
+        // state yields no entries: the section goes away entirely.
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
+        sync.active_containers.lock().await.insert(
+            "c1".to_string(),
+            ContainerInfo {
+                id: "c1".to_string(),
+                name: "web".to_string(),
+                ip_address: None,
+                networks: BTreeMap::new(),
+                domain_names: vec!["bad name".to_string()],
+                running: true,
+            },
+        );
+
+        assert_eq!(
+            sync.write_hosts_file_immediate().await.unwrap(),
+            WriteOutcome::Removed,
+            "a container without entries must not count as an updated section"
+        );
+        assert!(!fs::read_to_string(&path).unwrap().contains(START_TAG));
+
+        assert!(
+            write_summary(false, 1, 0).contains("Removed empty managed section"),
+            "{}",
+            write_summary(false, 1, 0)
+        );
+        assert!(write_summary(true, 2, 3).contains("Updated hosts file"));
+    }
+
+    #[test]
+    fn test_short_id_abbreviates_like_docker_ps() {
+        assert_eq!(short_id("0123456789abcdef0123456789abcdef"), "0123456789ab");
+        assert_eq!(short_id("abc"), "abc", "short IDs are shown whole");
+    }
+
+    #[tokio::test]
+    async fn test_listen_events_subscribes_only_to_handled_event_types() {
+        let hosts = hosts_file_with_localhost();
+        let (sync, docker) =
+            Synchronizer::new_fake(hosts.path().to_path_buf(), ".docker".to_string(), true, 10);
+
+        listen_briefly(&sync).await;
+
+        // Unfiltered, the daemon would stream every image, volume and plugin
+        // event to us, only for `handle_event` to discard them.
+        let subscriptions = docker.subscriptions();
+        let filters = subscriptions
+            .first()
+            .and_then(|options| options.filters.as_ref())
+            .expect("the subscription must be filtered");
+        assert_eq!(
+            filters.get("type"),
+            Some(&vec!["container".to_string(), "network".to_string()])
+        );
     }
 
     #[tokio::test]

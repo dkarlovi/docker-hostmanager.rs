@@ -33,14 +33,8 @@ impl Engine {
     /// Lists the containers that are currently running.
     pub async fn list_running(&self) -> Result<Vec<ContainerSummary>, Error> {
         match self {
-            Self::Native(docker) => {
-                docker
-                    .list_containers(Some(ListContainersOptions {
-                        all: false,
-                        ..Default::default()
-                    }))
-                    .await
-            }
+            // Without options, Docker lists only running containers.
+            Self::Native(docker) => docker.list_containers(None::<ListContainersOptions>).await,
             #[cfg(test)]
             Self::Fake(ctrl) => Ok(ctrl.list_running()),
         }
@@ -150,5 +144,18 @@ pub mod fake {
             });
             Box::pin(tokio_stream::iter(queued.into_iter().map(Ok)).chain(tokio_stream::pending()))
         }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests should fail loudly")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_debug_names_the_backend_without_its_internals() {
+        let native = Engine::Native(Docker::connect_with_socket_defaults().unwrap());
+
+        assert_eq!(format!("{native:?}"), "Engine::Native");
     }
 }
