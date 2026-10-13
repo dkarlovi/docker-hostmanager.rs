@@ -30,10 +30,18 @@ tempfile = "3"
 
 [lints.rust]
 unsafe_code = "warn"
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
 
 # Production-critical restriction lints
 unwrap_used = "warn"
@@ -78,12 +86,31 @@ as_conversions = "warn"
 arithmetic_side_effects = "warn"
 multiple_unsafe_ops_per_block = "warn"
 infinite_loop = "warn"
+as_pointer_underscore = "warn"
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+deref_by_slicing = "warn"
+disallowed_script_idents = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+fn_to_numeric_cast_any = "warn"
+redundant_type_annotations = "warn"
+renamed_function_params = "warn"
+semicolon_outside_block = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unused_result_ok = "warn"
+too_long_first_doc_paragraph = "warn"
 
 # Allow for CLI apps (would warn in libraries)
 print_stdout = "allow"
 print_stderr = "allow"
 
 # Disable overly pedantic lints
+# Duplicate versions come from transitive dependencies (e.g. two `syn` majors)
+# and can only be fixed upstream.
+multiple_crate_versions = "allow"
 too_many_lines = "allow"
 missing_docs_in_private_items = "allow"
 missing_errors_doc = "allow"

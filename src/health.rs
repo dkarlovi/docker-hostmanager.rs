@@ -33,7 +33,15 @@ use tokio::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use tracing::{debug, error};
 
-fn now_secs() -> u64 {
+/// Pause after a failed `accept` before trying again.
+///
+/// Keeps a persistently failing listener (e.g. out of file descriptors) from
+/// spinning hot, while still answering the next probe well within its timeout.
+#[cfg(unix)]
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Current Unix time in whole seconds, or 0 if the clock is before 1970.
+pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -151,8 +159,7 @@ pub async fn serve(state: Arc<HealthState>, path: PathBuf) {
             }
             Err(e) => {
                 warn!("Health socket accept failed: {e}");
-                // Don't spin hot if the listener is persistently unhappy.
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
             }
         }
     }

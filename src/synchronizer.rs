@@ -1,20 +1,21 @@
 use anyhow::{Context, Result};
 use bollard::models::{ContainerInspectResponse, EventActor, EventMessage, EventMessageTypeEnum};
-use bollard::query_parameters::{EventsOptions, InspectContainerOptions, ListContainersOptions};
+use bollard::query_parameters::EventsOptions;
 use bollard::Docker;
 use colored::Colorize;
+
+use crate::engine::Engine;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 
-use crate::health::HealthState;
+use crate::health::{now_secs, HealthState};
 use crate::types::{ContainerInfo, NetworkInfo};
 
 const START_TAG: &str = "## docker-hostmanager-start";
@@ -22,6 +23,13 @@ const END_TAG: &str = "## docker-hostmanager-end";
 
 /// The network `docker run` attaches to when none is given.
 const DEFAULT_BRIDGE_NETWORK: &str = "bridge";
+
+/// Longest name a resolver accepts: RFC 1035 caps a full domain name at 253
+/// characters in its dotted text form.
+const MAX_HOSTNAME_LEN: usize = 253;
+
+/// Length of the abbreviated container IDs shown in output, matching `docker ps`.
+const SHORT_ID_LEN: usize = 12;
 
 /// How often the event loop refreshes its liveness timestamp when Docker is quiet.
 const HEARTBEAT_SECS: u64 = 10;
@@ -251,11 +259,16 @@ fn expand_template(input: &str, vars: &HashMap<String, String>) -> String {
     result
 }
 
+/// Abbreviates container `id` the way the Docker CLI does.
+fn short_id(id: &str) -> &str {
+    id.get(..SHORT_ID_LEN).unwrap_or(id)
+}
+
 /// Whether `name` can be written into the hosts file without changing its
 /// structure: hostname characters only, plus braces so an unresolved
 /// `{TEMPLATE}` can still be reported as skipped.
 fn is_hosts_file_safe(name: &str) -> bool {
-    (1..=253).contains(&name.len())
+    (1..=MAX_HOSTNAME_LEN).contains(&name.len())
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '{' | '}'))
@@ -279,8 +292,9 @@ pub struct HostnameConflict {
     pub owner_name: String,
 }
 
+#[derive(Debug)]
 pub struct Synchronizer {
-    docker: Docker,
+    engine: Engine,
     hosts_file: PathBuf,
     tld: String,
     write_enabled: bool,
@@ -304,8 +318,43 @@ impl Synchronizer {
         write_enabled: bool,
         debounce_ms: u64,
     ) -> Self {
+        Self::with_engine(
+            Engine::Native(docker),
+            hosts_file,
+            tld,
+            write_enabled,
+            debounce_ms,
+        )
+    }
+
+    /// Creates a synchronizer backed by a fake daemon, and the handle that drives it.
+    #[cfg(test)]
+    pub fn new_fake(
+        hosts_file: PathBuf,
+        tld: String,
+        write_enabled: bool,
+        debounce_ms: u64,
+    ) -> (Self, crate::engine::fake::Ctrl) {
+        let ctrl = crate::engine::fake::Ctrl::default();
+        let sync = Self::with_engine(
+            Engine::Fake(ctrl.clone()),
+            hosts_file,
+            tld,
+            write_enabled,
+            debounce_ms,
+        );
+        (sync, ctrl)
+    }
+
+    fn with_engine(
+        engine: Engine,
+        hosts_file: PathBuf,
+        tld: String,
+        write_enabled: bool,
+        debounce_ms: u64,
+    ) -> Self {
         Self {
-            docker,
+            engine,
             hosts_file,
             tld,
             write_enabled,
@@ -325,33 +374,21 @@ impl Synchronizer {
     }
 
     pub async fn synchronize(&self) -> Result<()> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
-        self.sync_started_at.store(now, Ordering::Relaxed);
+        self.sync_started_at.store(now_secs(), Ordering::Relaxed);
 
         info!("Fetching running containers...");
 
         let containers = self
-            .docker
-            .list_containers(Some(ListContainersOptions {
-                all: false,
-                ..Default::default()
-            }))
+            .engine
+            .list_running()
             .await
             .context("Failed to list containers")?;
 
         info!("Found {} running containers", containers.len());
 
         // Clear all state for a clean rebuild
-        {
-            let mut active = self.active_containers.lock().await;
-            active.clear();
-        }
-        {
-            let mut claims = self.hostname_claims.lock().await;
-            claims.clear();
-        }
+        self.active_containers.lock().await.clear();
+        self.hostname_claims.lock().await.clear();
 
         // Inspect all containers, collecting start times for deterministic ordering
         let mut inspected: Vec<(Option<String>, String, ContainerInfo)> = Vec::new();
@@ -382,7 +419,7 @@ impl Synchronizer {
 
         // Claim hostnames and populate active containers in start-time order
         for (_, id, info) in inspected {
-            let short_id = id.get(..12).unwrap_or(&id);
+            let short_id = short_id(&id);
             debug!("Adding container: {} ({})", info.name, short_id);
             self.claim_hostnames(&id, &info).await;
             let mut active = self.active_containers.lock().await;
@@ -449,26 +486,12 @@ impl Synchronizer {
             0 => None,
             secs => Some(secs),
         };
-        let events = self.docker.events(Some(Self::events_options(since)));
+        let events = self.engine.events(events_options(since));
 
         tokio::select! {
             result = self.consume_events(events) => result,
             result = self.process_pending_writes() => result,
             result = self.mark_alive() => result,
-        }
-    }
-
-    fn events_options(since: Option<u64>) -> EventsOptions {
-        let mut filters = HashMap::new();
-        filters.insert(
-            "type".to_string(),
-            vec!["container".to_string(), "network".to_string()],
-        );
-
-        EventsOptions {
-            since: since.map(|secs| secs.to_string()),
-            filters: Some(filters),
-            ..Default::default()
         }
     }
 
@@ -522,7 +545,7 @@ impl Synchronizer {
             return Ok(());
         }
 
-        let short_actor_id = actor_id.get(..12).unwrap_or(actor_id);
+        let short_actor_id = short_id(actor_id);
         debug!(
             "Event: {} {} ({})",
             action,
@@ -548,13 +571,12 @@ impl Synchronizer {
             // lives in attributes. Only the hostnames bound to the specific network
             // should be touched — never the container's claims on other networks.
             (Some(EventMessageTypeEnum::NETWORK), "connect") => {
-                if let Some((container_id, _network_name)) = Self::network_event_targets(actor_ref)
-                {
+                if let Some((container_id, _network_name)) = network_event_targets(actor_ref) {
                     self.handle_container_up(&container_id).await?;
                 }
             }
             (Some(EventMessageTypeEnum::NETWORK), "disconnect") => {
-                if let Some((container_id, network_name)) = Self::network_event_targets(actor_ref) {
+                if let Some((container_id, network_name)) = network_event_targets(actor_ref) {
                     self.handle_network_disconnect(&container_id, &network_name)
                         .await;
                 }
@@ -570,7 +592,7 @@ impl Synchronizer {
             if !info.is_routable() {
                 return Ok(());
             }
-            let short_actor_id = container_id.get(..12).unwrap_or(container_id);
+            let short_actor_id = short_id(container_id);
             println!(
                 "{} Container {} ({})",
                 "▶".bright_green(),
@@ -591,7 +613,7 @@ impl Synchronizer {
         if let Some(info) = active.remove(container_id) {
             drop(active);
             self.release_hostnames(container_id, &info, None).await;
-            let short_actor_id = container_id.get(..12).unwrap_or(container_id);
+            let short_actor_id = short_id(container_id);
             println!(
                 "{} Container {} ({})",
                 "■".bright_red(),
@@ -635,134 +657,9 @@ impl Synchronizer {
         self.schedule_write();
     }
 
-    fn network_event_targets(actor: Option<&EventActor>) -> Option<(String, String)> {
-        let attrs = actor?.attributes.as_ref()?;
-        let container_id = attrs.get("container")?.clone();
-        let network_name = attrs.get("name")?.clone();
-        if container_id.is_empty() || network_name.is_empty() {
-            return None;
-        }
-        Some((container_id, network_name))
-    }
-
     async fn inspect_container(&self, id: &str) -> Result<Option<ContainerInfo>> {
-        let container = self
-            .docker
-            .inspect_container(id, None::<InspectContainerOptions>)
-            .await
-            .context("Failed to inspect container")?;
-
-        Ok(Self::extract_container_info(container))
-    }
-
-    fn extract_container_info(container: ContainerInspectResponse) -> Option<ContainerInfo> {
-        let id = container.id?;
-        let name = container.name?.trim_start_matches('/').to_string();
-
-        let state = container.state?;
-        let running = state.running.unwrap_or(false);
-
-        let network_settings = container.network_settings?;
-
-        // Check if container has exposed ports
-        let has_ports = network_settings.ports.is_some_and(|p| !p.is_empty());
-
-        if !has_ports && !running {
-            return None;
-        }
-
-        let networks: BTreeMap<String, NetworkInfo> = network_settings
-            .networks
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(network_name, network)| {
-                let ip = network.ip_address.filter(|ip| !ip.is_empty())?;
-                let mut aliases = network.aliases.unwrap_or_default();
-                // Always include the container name as an alias
-                if !aliases.contains(&name) {
-                    aliases.push(name.clone());
-                }
-
-                Some((
-                    network_name,
-                    NetworkInfo {
-                        ip_address: ip,
-                        aliases,
-                    },
-                ))
-            })
-            .collect();
-
-        // Build variables map from environment variables and specific labels
-        let mut vars = HashMap::new();
-        let mut compose_project: Option<String> = None;
-
-        if let Some(config) = &container.config {
-            if let Some(env_vars) = &config.env {
-                for env_var in env_vars {
-                    if let Some((k, v)) = env_var.split_once('=') {
-                        vars.insert(k.to_string(), v.to_string());
-                    }
-                }
-            }
-            if let Some(labels) = &config.labels {
-                if let Some(proj) = labels.get("com.docker.compose.project") {
-                    compose_project = Some(proj.clone());
-                }
-            }
-        }
-
-        if !vars.contains_key("COMPOSE_PROJECT_NAME") {
-            let proj_name = compose_project
-                .unwrap_or_else(|| name.split('-').next().unwrap_or(&name).to_string());
-            vars.insert("COMPOSE_PROJECT_NAME".to_string(), proj_name);
-        }
-
-        // Extract DOMAIN_NAME environment variable
-        let mut domain_names = Vec::new();
-        if let Some(config) = container.config {
-            if let Some(env_vars) = config.env {
-                for env in env_vars {
-                    if let Some(domain_value) = env.strip_prefix("DOMAIN_NAME=") {
-                        let replaced_domain = expand_template(domain_value, &vars);
-                        domain_names.extend(
-                            replaced_domain
-                                .split(',')
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty()),
-                        );
-                    }
-                }
-            }
-
-            // Extract dev.orbstack.domains label
-            if let Some(labels) = config.labels {
-                if let Some(orbstack_domains) = labels.get("dev.orbstack.domains") {
-                    let replaced_domains = expand_template(orbstack_domains, &vars);
-                    domain_names.extend(
-                        replaced_domains
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty()),
-                    );
-                }
-            }
-        }
-
-        // Docker's API used to expose the default bridge endpoint's address as a
-        // top-level `IPAddress`; that field is gone, so read it from the source.
-        let ip_address = networks
-            .get(DEFAULT_BRIDGE_NETWORK)
-            .map(|bridge| bridge.ip_address.clone());
-
-        Some(ContainerInfo {
-            id,
-            name,
-            ip_address,
-            networks,
-            domain_names,
-            running,
-        })
+        let (_, info) = self.inspect_container_with_start_time(id).await?;
+        Ok(info)
     }
 
     /// Attempts to claim all hostnames generated by `container`. The first container
@@ -863,12 +760,12 @@ impl Synchronizer {
         id: &str,
     ) -> Result<(Option<String>, Option<ContainerInfo>)> {
         let container = self
-            .docker
-            .inspect_container(id, None::<InspectContainerOptions>)
+            .engine
+            .inspect(id)
             .await
             .context("Failed to inspect container")?;
         let started_at = container.state.as_ref().and_then(|s| s.started_at.clone());
-        Ok((started_at, Self::extract_container_info(container)))
+        Ok((started_at, extract_container_info(container)))
     }
 
     async fn write_hosts_file_immediate(&self) -> Result<WriteOutcome> {
@@ -1078,6 +975,144 @@ impl Synchronizer {
     }
 }
 
+/// Turns Docker's inspection data into the hostnames-relevant view of a
+/// container, or `None` if it is not running and publishes no ports.
+fn extract_container_info(container: ContainerInspectResponse) -> Option<ContainerInfo> {
+    let id = container.id?;
+    let name = container.name?.trim_start_matches('/').to_string();
+
+    let state = container.state?;
+    let running = state.running.unwrap_or(false);
+
+    let network_settings = container.network_settings?;
+
+    // Check if container has exposed ports
+    let has_ports = network_settings.ports.is_some_and(|p| !p.is_empty());
+
+    if !has_ports && !running {
+        return None;
+    }
+
+    let networks: BTreeMap<String, NetworkInfo> = network_settings
+        .networks
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(network_name, network)| {
+            let ip = network.ip_address.filter(|ip| !ip.is_empty())?;
+            let mut aliases = network.aliases.unwrap_or_default();
+            // Always include the container name as an alias
+            if !aliases.contains(&name) {
+                aliases.push(name.clone());
+            }
+
+            Some((
+                network_name,
+                NetworkInfo {
+                    ip_address: ip,
+                    aliases,
+                },
+            ))
+        })
+        .collect();
+
+    // Build variables map from environment variables and specific labels
+    let mut vars = HashMap::new();
+    let mut compose_project: Option<String> = None;
+
+    if let Some(config) = &container.config {
+        if let Some(env_vars) = &config.env {
+            for env_var in env_vars {
+                if let Some((k, v)) = env_var.split_once('=') {
+                    vars.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+        if let Some(labels) = &config.labels {
+            if let Some(proj) = labels.get("com.docker.compose.project") {
+                compose_project = Some(proj.clone());
+            }
+        }
+    }
+
+    if !vars.contains_key("COMPOSE_PROJECT_NAME") {
+        let proj_name =
+            compose_project.unwrap_or_else(|| name.split('-').next().unwrap_or(&name).to_string());
+        vars.insert("COMPOSE_PROJECT_NAME".to_string(), proj_name);
+    }
+
+    // Extract DOMAIN_NAME environment variable
+    let mut domain_names = Vec::new();
+    if let Some(config) = container.config {
+        if let Some(env_vars) = config.env {
+            for env in env_vars {
+                if let Some(domain_value) = env.strip_prefix("DOMAIN_NAME=") {
+                    let replaced_domain = expand_template(domain_value, &vars);
+                    domain_names.extend(
+                        replaced_domain
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty()),
+                    );
+                }
+            }
+        }
+
+        // Extract dev.orbstack.domains label
+        if let Some(labels) = config.labels {
+            if let Some(orbstack_domains) = labels.get("dev.orbstack.domains") {
+                let replaced_domains = expand_template(orbstack_domains, &vars);
+                domain_names.extend(
+                    replaced_domains
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                );
+            }
+        }
+    }
+
+    // Docker's API used to expose the default bridge endpoint's address as a
+    // top-level `IPAddress`; that field is gone, so read it from the source.
+    let ip_address = networks
+        .get(DEFAULT_BRIDGE_NETWORK)
+        .map(|bridge| bridge.ip_address.clone());
+
+    Some(ContainerInfo {
+        id,
+        name,
+        ip_address,
+        networks,
+        domain_names,
+        running,
+    })
+}
+
+/// Pulls the container ID and network name out of a network event's actor.
+fn network_event_targets(actor: Option<&EventActor>) -> Option<(String, String)> {
+    let attrs = actor?.attributes.as_ref()?;
+    let container_id = attrs.get("container")?.clone();
+    let network_name = attrs.get("name")?.clone();
+    if container_id.is_empty() || network_name.is_empty() {
+        return None;
+    }
+    Some((container_id, network_name))
+}
+
+/// The event subscription: container and network events, replayed from `since`.
+fn events_options(since: Option<u64>) -> EventsOptions {
+    let mut filters = HashMap::new();
+    filters.insert(
+        "type".to_string(),
+        vec!["container".to_string(), "network".to_string()],
+    );
+
+    EventsOptions {
+        since: since.map(|secs| secs.to_string()),
+        filters: Some(filters),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -1086,7 +1121,6 @@ impl Synchronizer {
 )]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::NamedTempFile;
 
     #[tokio::test]
@@ -1101,20 +1135,17 @@ mod tests {
         let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
 
         // Add a test container
-        {
-            let mut active = sync.active_containers.lock().await;
-            active.insert(
-                "test123".to_string(),
-                ContainerInfo {
-                    id: "test123".to_string(),
-                    name: "nginx".to_string(),
-                    ip_address: Some("172.17.0.2".to_string()),
-                    networks: BTreeMap::new(),
-                    domain_names: vec![],
-                    running: true,
-                },
-            );
-        }
+        sync.active_containers.lock().await.insert(
+            "test123".to_string(),
+            ContainerInfo {
+                id: "test123".to_string(),
+                name: "nginx".to_string(),
+                ip_address: Some("172.17.0.2".to_string()),
+                networks: BTreeMap::new(),
+                domain_names: vec![],
+                running: true,
+            },
+        );
 
         sync.write_hosts_file_immediate().await.unwrap();
 
@@ -1152,20 +1183,17 @@ mod tests {
             },
         );
 
-        {
-            let mut active = sync.active_containers.lock().await;
-            active.insert(
-                "test123".to_string(),
-                ContainerInfo {
-                    id: "test123".to_string(),
-                    name: "web".to_string(),
-                    ip_address: None,
-                    networks,
-                    domain_names: vec![],
-                    running: true,
-                },
-            );
-        }
+        sync.active_containers.lock().await.insert(
+            "test123".to_string(),
+            ContainerInfo {
+                id: "test123".to_string(),
+                name: "web".to_string(),
+                ip_address: None,
+                networks,
+                domain_names: vec![],
+                running: true,
+            },
+        );
 
         sync.write_hosts_file_immediate().await.unwrap();
 
@@ -1362,16 +1390,129 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_events_options_replays_from_sync_start() {
-        let options = Synchronizer::events_options(Some(1_700_000_000));
+    /// A running container `name` attached to `network` at `ip`, as Docker
+    /// would report it on inspection.
+    fn running_container(
+        id: &str,
+        name: &str,
+        network: &str,
+        ip: &str,
+    ) -> ContainerInspectResponse {
+        ContainerInspectResponse {
+            id: Some(id.to_string()),
+            name: Some(format!("/{name}")),
+            state: Some(bollard::models::ContainerState {
+                running: Some(true),
+                started_at: Some("2026-01-01T00:00:00Z".to_string()),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                networks: Some(HashMap::from([(
+                    network.to_string(),
+                    bollard::models::EndpointSettings {
+                        ip_address: Some(ip.to_string()),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
 
-        assert_eq!(options.since.as_deref(), Some("1700000000"));
-        let filters = options.filters.expect("events must be filtered");
-        assert_eq!(
-            filters.get("type"),
-            Some(&vec!["container".to_string(), "network".to_string()])
+    fn container_event(action: &str, id: &str) -> EventMessage {
+        EventMessage {
+            typ: Some(EventMessageTypeEnum::CONTAINER),
+            action: Some(action.to_string()),
+            actor: Some(EventActor {
+                id: Some(id.to_string()),
+                attributes: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Runs the event loop long enough to deliver queued events and flush the
+    /// debounced write. The fake stream stays open, so the loop never ends itself.
+    async fn listen_briefly(sync: &Synchronizer) {
+        let outcome = tokio::time::timeout(Duration::from_millis(200), sync.listen_events()).await;
+        assert!(
+            outcome.is_err(),
+            "the event loop ended on its own: {outcome:?}"
         );
+    }
+
+    fn hosts_file_with_localhost() -> NamedTempFile {
+        let temp_file = NamedTempFile::new().unwrap();
+        fs::write(temp_file.path(), "127.0.0.1 localhost\n").unwrap();
+        temp_file
+    }
+
+    #[tokio::test]
+    async fn test_synchronize_writes_running_containers() {
+        let hosts = hosts_file_with_localhost();
+        let (sync, docker) =
+            Synchronizer::new_fake(hosts.path().to_path_buf(), ".docker".to_string(), true, 10);
+        docker.start(running_container("c1", "web", "app", "172.18.0.2"));
+
+        sync.synchronize().await.unwrap();
+
+        let content = fs::read_to_string(hosts.path()).unwrap();
+        assert!(content.contains("172.18.0.2 web.app\n"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn test_listen_events_replays_from_sync_start() {
+        let hosts = hosts_file_with_localhost();
+        let (sync, docker) =
+            Synchronizer::new_fake(hosts.path().to_path_buf(), ".docker".to_string(), true, 10);
+        let before_sync = now_secs();
+
+        sync.synchronize().await.unwrap();
+        listen_briefly(&sync).await;
+
+        let subscriptions = docker.subscriptions();
+        let since: u64 = subscriptions
+            .first()
+            .and_then(|options| options.since.as_deref())
+            .expect("the subscription must replay events missed since the sync began")
+            .parse()
+            .unwrap();
+        assert!(
+            (before_sync..=before_sync + 5).contains(&since),
+            "replay should start when the sync did ({before_sync}), got {since}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_container_start_event_adds_hosts_entry() {
+        let hosts = hosts_file_with_localhost();
+        let (sync, docker) =
+            Synchronizer::new_fake(hosts.path().to_path_buf(), ".docker".to_string(), true, 10);
+        sync.synchronize().await.unwrap();
+
+        docker.start(running_container("c1", "web", "app", "172.18.0.2"));
+        docker.emit(container_event("start", "c1"));
+        listen_briefly(&sync).await;
+
+        let content = fs::read_to_string(hosts.path()).unwrap();
+        assert!(content.contains("172.18.0.2 web.app\n"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn test_container_die_event_removes_hosts_entry() {
+        let hosts = hosts_file_with_localhost();
+        let (sync, docker) =
+            Synchronizer::new_fake(hosts.path().to_path_buf(), ".docker".to_string(), true, 10);
+        docker.start(running_container("c1", "web", "app", "172.18.0.2"));
+        sync.synchronize().await.unwrap();
+
+        docker.remove("c1");
+        docker.emit(container_event("die", "c1"));
+        listen_briefly(&sync).await;
+
+        let content = fs::read_to_string(hosts.path()).unwrap();
+        assert!(!content.contains("web.app"), "{content}");
     }
 
     #[tokio::test]
@@ -1445,20 +1586,17 @@ mod tests {
             },
         );
 
-        {
-            let mut active = sync.active_containers.lock().await;
-            active.insert(
-                "test123".to_string(),
-                ContainerInfo {
-                    id: "test123".to_string(),
-                    name: "web".to_string(),
-                    ip_address: None,
-                    networks,
-                    domain_names: vec![],
-                    running: true,
-                },
-            );
-        }
+        sync.active_containers.lock().await.insert(
+            "test123".to_string(),
+            ContainerInfo {
+                id: "test123".to_string(),
+                name: "web".to_string(),
+                ip_address: None,
+                networks,
+                domain_names: vec![],
+                running: true,
+            },
+        );
 
         sync.write_hosts_file_immediate().await.unwrap();
 
@@ -1501,7 +1639,7 @@ mod tests {
             ..Default::default()
         };
 
-        let info = Synchronizer::extract_container_info(container);
+        let info = extract_container_info(container);
         assert!(info.is_some());
 
         let container_info = info.unwrap();
@@ -1546,11 +1684,8 @@ mod tests {
 
     #[test]
     fn test_extract_container_info_uses_default_bridge_ip_as_global_ip() {
-        let info = Synchronizer::extract_container_info(container_on_networks(&[(
-            "bridge",
-            "172.17.0.2",
-        )]))
-        .expect("container should be extracted");
+        let info = extract_container_info(container_on_networks(&[("bridge", "172.17.0.2")]))
+            .expect("container should be extracted");
 
         assert_eq!(info.ip_address.as_deref(), Some("172.17.0.2"));
         assert_eq!(
@@ -1562,11 +1697,9 @@ mod tests {
 
     #[test]
     fn test_extract_container_info_has_no_global_ip_off_the_default_bridge() {
-        let info = Synchronizer::extract_container_info(container_on_networks(&[(
-            "myapp_default",
-            "172.18.0.2",
-        )]))
-        .expect("container should be extracted");
+        let info =
+            extract_container_info(container_on_networks(&[("myapp_default", "172.18.0.2")]))
+                .expect("container should be extracted");
 
         assert_eq!(info.ip_address, None);
     }
@@ -1597,7 +1730,7 @@ mod tests {
             ..Default::default()
         };
 
-        let info = Synchronizer::extract_container_info(container);
+        let info = extract_container_info(container);
         assert!(info.is_some());
 
         let container_info = info.unwrap();
@@ -1637,7 +1770,7 @@ mod tests {
             ..Default::default()
         };
 
-        let info = Synchronizer::extract_container_info(container);
+        let info = extract_container_info(container);
         assert!(info.is_some());
 
         let container_info = info.unwrap();
@@ -1673,7 +1806,7 @@ mod tests {
             ..Default::default()
         };
 
-        let info = Synchronizer::extract_container_info(container);
+        let info = extract_container_info(container);
         assert!(info.is_some());
         let container_info = info.unwrap();
 
@@ -1716,7 +1849,7 @@ mod tests {
             ..Default::default()
         };
 
-        let info = Synchronizer::extract_container_info(container);
+        let info = extract_container_info(container);
         assert!(info.is_some());
         let container_info = info.unwrap();
         assert!(container_info
@@ -1746,7 +1879,7 @@ mod tests {
             ..Default::default()
         };
 
-        let info = Synchronizer::extract_container_info(container);
+        let info = extract_container_info(container);
         assert!(info.is_some());
         let container_info = info.unwrap();
         // Fallback should extract "myworktree" from "/myworktree-web-1"
@@ -1878,10 +2011,7 @@ mod tests {
                 assert!(content.contains("172.17.0.2 nginx.docker"));
 
                 // Silently swap in a different container — no schedule_write
-                {
-                    let mut active = sync.active_containers.lock().await;
-                    active.clear();
-                }
+                sync.active_containers.lock().await.clear();
                 seed_container(&sync, "b", "redis", "172.17.0.3").await;
 
                 // Wait well past a full debounce window
@@ -2048,10 +2178,7 @@ mod tests {
 
         // A stops — release its hostnames then remove from active
         sync.release_hostnames("aaa", &container_a, None).await;
-        {
-            let mut active = sync.active_containers.lock().await;
-            active.remove("aaa");
-        }
+        sync.active_containers.lock().await.remove("aaa");
 
         // B can now claim myapp.local
         let container_b = ContainerInfo {
@@ -2531,7 +2658,7 @@ mod tests {
             attributes: Some(attrs),
         };
         assert_eq!(
-            Synchronizer::network_event_targets(Some(&actor)),
+            network_event_targets(Some(&actor)),
             Some(("abc123".to_string(), "public".to_string()))
         );
 
@@ -2539,11 +2666,8 @@ mod tests {
             id: Some("net-id".to_string()),
             attributes: Some(HashMap::new()),
         };
-        assert_eq!(
-            Synchronizer::network_event_targets(Some(&actor_missing)),
-            None
-        );
-        assert_eq!(Synchronizer::network_event_targets(None), None);
+        assert_eq!(network_event_targets(Some(&actor_missing)), None);
+        assert_eq!(network_event_targets(None), None);
     }
 
     // ---- regression tests for the 2026-08-07 incident ----------------------
@@ -2618,10 +2742,7 @@ mod tests {
 
         let mut perms = fs::metadata(&path).unwrap().permissions();
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            perms.set_mode(0o444);
-        }
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o444);
         #[cfg(not(unix))]
         perms.set_readonly(true);
         fs::set_permissions(&path, perms).unwrap();
@@ -2631,10 +2752,7 @@ mod tests {
         // Restore permissions so the temp file can be cleaned up.
         let mut restore = fs::metadata(&path).unwrap().permissions();
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            restore.set_mode(0o644);
-        }
+        std::os::unix::fs::PermissionsExt::set_mode(&mut restore, 0o644);
         #[cfg(not(unix))]
         restore.set_readonly(false);
         fs::set_permissions(&path, restore).unwrap();
@@ -2788,9 +2906,7 @@ mod tests {
         // process before the write could return an error to inspect.
         // SAFETY: takes plain scalars and affects only this process, which
         // exists solely to run this one test.
-        unsafe {
-            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
-        }
+        unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
         // SAFETY: takes a scalar and a pointer to the local above, and affects
         // only this process, which exists solely to run this one test.
         unsafe {

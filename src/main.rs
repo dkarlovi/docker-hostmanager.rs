@@ -5,6 +5,7 @@ use colored::Colorize;
 use std::path::PathBuf;
 use tokio::signal;
 
+mod engine;
 mod health;
 mod synchronizer;
 mod types;
@@ -14,6 +15,18 @@ use synchronizer::{probe_reservation_support, ReservationSupport, Synchronizer};
 // Version from git tag at build time
 const VERSION: &str = env!("GIT_VERSION");
 const PACKAGE_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// How long a single Docker API request may take, in seconds.
+///
+/// Generous because the initial sync inspects every running container in turn
+/// on hosts that may be busy; bollard's own default is the same two minutes.
+const DOCKER_TIMEOUT_SECS: u64 = 120;
+
+/// How long the `health` subcommand waits for the daemon to answer.
+///
+/// Matches the image's `HEALTHCHECK --timeout=5s`: Docker kills the probe at
+/// that point anyway, and answering sooner yields a clearer failure message.
+const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Parser, Debug)]
 #[command(author, version = VERSION, about = "Docker Host Manager - Automatically update /etc/hosts with container hostnames", long_about = None)]
@@ -136,7 +149,7 @@ async fn main() -> Result<()> {
         let summary = health::probe(
             &args.health_socket,
             args.health_max_age_secs,
-            std::time::Duration::from_secs(5),
+            HEALTH_PROBE_TIMEOUT,
         )
         .await
         .context("health check failed")?;
@@ -159,8 +172,12 @@ async fn main() -> Result<()> {
         "Connecting to Docker at".bright_blue(),
         args.socket.bright_white()
     );
-    let docker = Docker::connect_with_socket(&args.socket, 120, bollard::API_DEFAULT_VERSION)
-        .context("Failed to connect to Docker socket")?;
+    let docker = Docker::connect_with_socket(
+        &args.socket,
+        DOCKER_TIMEOUT_SECS,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .context("Failed to connect to Docker socket")?;
 
     // Verify connection
     let version = docker
