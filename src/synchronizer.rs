@@ -2371,7 +2371,7 @@ mod tests {
         let first = test_container("aaa", "shared", "172.17.0.2");
         let second = test_container("bbb", "shared", "172.17.0.3");
 
-        assert!(sync.claim_hostnames("aaa", &first).await.is_empty());
+        assert_eq!(sync.claim_hostnames("aaa", &first).await, []);
         let conflicts = sync.claim_hostnames("bbb", &second).await;
 
         assert_eq!(
