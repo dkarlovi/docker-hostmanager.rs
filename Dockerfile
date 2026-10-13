@@ -1,9 +1,9 @@
-FROM rust:1.98-slim AS chef
+FROM rust:1.98.1-slim AS chef
 RUN rustup target add x86_64-unknown-linux-musl && \
     rustup target add aarch64-unknown-linux-musl && \
     apt-get update && apt-get install -y musl-tools gcc-aarch64-linux-gnu && \
-    cargo install cargo-chef && \
-    cargo install cargo-auditable
+    cargo install cargo-chef --version '=0.1.78' --locked && \
+    cargo install cargo-auditable --version '=0.7.7' --locked
 WORKDIR /usr/src/app
 
 FROM chef AS planner
@@ -21,11 +21,13 @@ RUN case "$TARGETARCH" in \
     esac
 COPY --from=planner /usr/src/app/recipe.json recipe.json
 COPY .cargo .cargo
-RUN cargo chef cook --release --target $(cat /tmp/rust-target) --recipe-path recipe.json
+RUN cargo chef cook --no-build --recipe-path recipe.json && \
+    cargo fetch --locked --target $(cat /tmp/rust-target) && \
+    cargo chef cook --frozen --release --target $(cat /tmp/rust-target) --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 ENV GIT_VERSION=${VERSION}
-RUN cargo auditable build --release --target $(cat /tmp/rust-target) && \
+RUN cargo auditable build --frozen --release --target $(cat /tmp/rust-target) && \
     mkdir -p /output && \
     cp /usr/src/app/target/$(cat /tmp/rust-target)/release/docker-hostmanager /output/docker-hostmanager
 
