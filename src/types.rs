@@ -18,8 +18,9 @@ pub struct NetworkInfo {
 }
 
 impl ContainerInfo {
-    pub fn has_exposed_ports(&self) -> bool {
-        // A container is considered exposed if it's running and has an IP address
+    /// Whether the container can be given hosts entries: it is running and
+    /// reachable on at least one IP address.
+    pub fn is_routable(&self) -> bool {
         self.running && (self.ip_address.is_some() || !self.networks.is_empty())
     }
 
@@ -29,7 +30,13 @@ impl ContainerInfo {
         // Global IP address with simple hostname
         if let Some(ip) = &self.ip_address {
             let mut hosts = vec![format!("{}{}", self.name, tld)];
-            hosts.extend(self.domain_names.clone());
+            // `network:hostname` entries belong on that network's line only.
+            hosts.extend(
+                self.domain_names
+                    .iter()
+                    .filter(|domain| !domain.contains(':'))
+                    .cloned(),
+            );
             result.push((ip.clone(), hosts));
         }
 
@@ -85,7 +92,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_container_has_exposed_ports() {
+    fn test_global_hostnames_exclude_network_scoped_domains() {
+        let container = ContainerInfo {
+            id: "abc".to_string(),
+            name: "web".to_string(),
+            ip_address: Some("172.17.0.2".to_string()),
+            networks: BTreeMap::new(),
+            domain_names: vec!["plain.test".to_string(), "other:scoped.test".to_string()],
+            running: true,
+        };
+
+        assert_eq!(
+            container.get_hostnames(".docker"),
+            vec![(
+                "172.17.0.2".to_string(),
+                vec!["web.docker".to_string(), "plain.test".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn test_container_is_routable() {
         let container = ContainerInfo {
             id: "abc123".to_string(),
             name: "test".to_string(),
@@ -94,7 +121,7 @@ mod tests {
             domain_names: vec![],
             running: true,
         };
-        assert!(container.has_exposed_ports());
+        assert!(container.is_routable());
 
         let container_not_running = ContainerInfo {
             id: "abc123".to_string(),
@@ -104,7 +131,7 @@ mod tests {
             domain_names: vec![],
             running: false,
         };
-        assert!(!container_not_running.has_exposed_ports());
+        assert!(!container_not_running.is_routable());
 
         let container_no_ip = ContainerInfo {
             id: "abc123".to_string(),
@@ -114,7 +141,7 @@ mod tests {
             domain_names: vec![],
             running: true,
         };
-        assert!(!container_no_ip.has_exposed_ports());
+        assert!(!container_no_ip.is_routable());
     }
 
     #[test]

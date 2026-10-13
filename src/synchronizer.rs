@@ -6,7 +6,9 @@ use colored::Colorize;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
@@ -17,6 +19,9 @@ use crate::types::{ContainerInfo, NetworkInfo};
 
 const START_TAG: &str = "## docker-hostmanager-start";
 const END_TAG: &str = "## docker-hostmanager-end";
+
+/// The network `docker run` attaches to when none is given.
+const DEFAULT_BRIDGE_NETWORK: &str = "bridge";
 
 /// How often the event loop refreshes its liveness timestamp when Docker is quiet.
 const HEARTBEAT_SECS: u64 = 10;
@@ -207,6 +212,66 @@ fn write_in_place(path: &Path, content: &str, previous: &str) -> Result<()> {
     Ok(())
 }
 
+/// Replaces each `{VAR}` in `input` with its value from `vars`. Unknown
+/// variables are left as written, so they can be reported as unresolved.
+fn expand_template(input: &str, vars: &HashMap<String, String>) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            let mut var_name = String::new();
+            let mut closed = false;
+            while let Some(&next_c) = chars.peek() {
+                if next_c == '}' {
+                    closed = true;
+                    chars.next(); // consume '}'
+                    break;
+                } else if next_c == '{' {
+                    break;
+                }
+                var_name.push(next_c);
+                chars.next();
+            }
+            if closed && !var_name.is_empty() {
+                if let Some(val) = vars.get(&var_name) {
+                    result.push_str(val);
+                } else {
+                    result.push('{');
+                    result.push_str(&var_name);
+                    result.push('}');
+                }
+            } else {
+                result.push('{');
+                result.push_str(&var_name);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Whether `name` can be written into the hosts file without changing its
+/// structure: hostname characters only, plus braces so an unresolved
+/// `{TEMPLATE}` can still be reported as skipped.
+fn is_hosts_file_safe(name: &str) -> bool {
+    (1..=253).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '{' | '}'))
+}
+
+/// What a hosts file update ended up doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// The file was rewritten with new contents.
+    Written,
+    /// The file already had the desired contents, so it was left alone.
+    Unchanged,
+    /// Watch mode: entries were displayed, never written.
+    DryRun,
+}
+
 /// A hostname a container could not claim because another container owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostnameConflict {
@@ -220,13 +285,15 @@ pub struct Synchronizer {
     tld: String,
     write_enabled: bool,
     debounce_ms: u64,
-    active_containers: Arc<Mutex<BTreeMap<String, ContainerInfo>>>,
+    active_containers: Mutex<BTreeMap<String, ContainerInfo>>,
     /// Maps each hostname to the (`container_id`, `container_name`) of the first claimant.
     /// Dynamic network-alias hostnames are also tracked here; they just never conflict
     /// because they always include a unique network name.
-    hostname_claims: Arc<Mutex<HashMap<String, (String, String)>>>,
+    hostname_claims: Mutex<HashMap<String, (String, String)>>,
     write_notify: Notify,
     health: Arc<HealthState>,
+    /// Unix seconds at which the last full sync started; 0 before the first.
+    sync_started_at: AtomicU64,
 }
 
 impl Synchronizer {
@@ -243,10 +310,11 @@ impl Synchronizer {
             tld,
             write_enabled,
             debounce_ms,
-            active_containers: Arc::new(Mutex::new(BTreeMap::new())),
-            hostname_claims: Arc::new(Mutex::new(HashMap::new())),
+            active_containers: Mutex::new(BTreeMap::new()),
+            hostname_claims: Mutex::new(HashMap::new()),
             write_notify: Notify::new(),
             health: Arc::new(HealthState::new()),
+            sync_started_at: AtomicU64::new(0),
         }
     }
 
@@ -257,6 +325,11 @@ impl Synchronizer {
     }
 
     pub async fn synchronize(&self) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        self.sync_started_at.store(now, Ordering::Relaxed);
+
         info!("Fetching running containers...");
 
         let containers = self
@@ -290,7 +363,7 @@ impl Synchronizer {
 
             match self.inspect_container_with_start_time(&id).await {
                 Ok((started_at, Some(info))) => {
-                    if info.has_exposed_ports() {
+                    if info.is_routable() {
                         inspected.push((started_at, id, info));
                     }
                 }
@@ -319,7 +392,7 @@ impl Synchronizer {
         // As in `process_pending_writes`, a failure here is logged rather than
         // fatal: the daemon stays up and retries on the next container event.
         match self.write_hosts_file_immediate().await {
-            Ok(()) => self.health.set_write_ok(true),
+            Ok(_) => self.health.set_write_ok(true),
             Err(e) => {
                 self.health.set_write_ok(false);
                 error!("Failed to write hosts file during initial sync (will retry on next event): {e:#}");
@@ -352,7 +425,7 @@ impl Synchronizer {
                         // user without hostname management for hours. Log it and
                         // keep serving; the next event retries the write.
                         match self.write_hosts_file_immediate().await {
-                            Ok(()) => self.health.set_write_ok(true),
+                            Ok(_) => self.health.set_write_ok(true),
                             Err(e) => {
                                 self.health.set_write_ok(false);
                                 error!("Failed to write hosts file (will retry on next event): {e:#}");
@@ -369,37 +442,58 @@ impl Synchronizer {
     }
 
     pub async fn listen_events(&self) -> Result<()> {
+        // Replay from when the initial sync began, so a container that started
+        // between listing and subscribing is not missed. Replayed events for
+        // containers already synced are idempotent.
+        let since = match self.sync_started_at.load(Ordering::Relaxed) {
+            0 => None,
+            secs => Some(secs),
+        };
+        let events = self.docker.events(Some(Self::events_options(since)));
+
+        tokio::select! {
+            result = self.consume_events(events) => result,
+            result = self.process_pending_writes() => result,
+            result = self.mark_alive() => result,
+        }
+    }
+
+    fn events_options(since: Option<u64>) -> EventsOptions {
         let mut filters = HashMap::new();
         filters.insert(
             "type".to_string(),
             vec!["container".to_string(), "network".to_string()],
         );
 
-        let mut events = self.docker.events(Some(EventsOptions {
+        EventsOptions {
+            since: since.map(|secs| secs.to_string()),
             filters: Some(filters),
             ..Default::default()
-        }));
+        }
+    }
 
-        tokio::select! {
-            result = async {
-                while let Some(event_result) = events.next().await {
-                    self.health.touch();
-                    match event_result {
-                        Ok(event) => {
-                            if let Err(e) = self.handle_event(event).await {
-                                error!("Error handling event: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Error receiving event: {}", e);
-                        }
+    async fn consume_events<S>(&self, events: S) -> Result<()>
+    where
+        S: tokio_stream::Stream<Item = Result<EventMessage, bollard::errors::Error>>,
+    {
+        let mut pinned = std::pin::pin!(events);
+        while let Some(event_result) = pinned.next().await {
+            self.health.touch();
+            match event_result {
+                Ok(event) => {
+                    if let Err(e) = self.handle_event(event).await {
+                        error!("Error handling event: {}", e);
                     }
                 }
-                Ok(())
-            } => result,
-            result = self.process_pending_writes() => result,
-            result = self.mark_alive() => result,
+                Err(e) => {
+                    error!("Error receiving event: {}", e);
+                }
+            }
         }
+        // Docker closes the stream when the daemon restarts. Exiting non-zero lets
+        // the restart policy bring us back with a full resync; returning Ok would
+        // look like a clean shutdown while every later event went unseen.
+        anyhow::bail!("Docker event stream ended")
     }
 
     /// Keeps the liveness timestamp fresh on a quiet Docker host, where hours can
@@ -473,7 +567,7 @@ impl Synchronizer {
 
     async fn handle_container_up(&self, container_id: &str) -> Result<()> {
         if let Some(info) = self.inspect_container(container_id).await? {
-            if !info.has_exposed_ports() {
+            if !info.is_routable() {
                 return Ok(());
             }
             let short_actor_id = container_id.get(..12).unwrap_or(container_id);
@@ -528,7 +622,7 @@ impl Synchronizer {
         // current network set. If the container is gone or no longer exposes
         // anything, treat as a full down event.
         match self.inspect_container(container_id).await {
-            Ok(Some(refreshed)) if refreshed.has_exposed_ports() => {
+            Ok(Some(refreshed)) if refreshed.is_routable() => {
                 let mut active = self.active_containers.lock().await;
                 active.insert(container_id.to_string(), refreshed);
             }
@@ -624,50 +718,13 @@ impl Synchronizer {
             vars.insert("COMPOSE_PROJECT_NAME".to_string(), proj_name);
         }
 
-        let replace_vars = |input: &str, vars: &HashMap<String, String>| -> String {
-            let mut result = String::with_capacity(input.len());
-            let mut chars = input.chars().peekable();
-            while let Some(c) = chars.next() {
-                if c == '{' {
-                    let mut var_name = String::new();
-                    let mut closed = false;
-                    while let Some(&next_c) = chars.peek() {
-                        if next_c == '}' {
-                            closed = true;
-                            chars.next(); // consume '}'
-                            break;
-                        } else if next_c == '{' {
-                            break;
-                        }
-                        var_name.push(next_c);
-                        chars.next();
-                    }
-                    if closed && !var_name.is_empty() {
-                        if let Some(val) = vars.get(&var_name) {
-                            result.push_str(val);
-                        } else {
-                            result.push('{');
-                            result.push_str(&var_name);
-                            result.push('}');
-                        }
-                    } else {
-                        result.push('{');
-                        result.push_str(&var_name);
-                    }
-                } else {
-                    result.push(c);
-                }
-            }
-            result
-        };
-
         // Extract DOMAIN_NAME environment variable
         let mut domain_names = Vec::new();
         if let Some(config) = container.config {
             if let Some(env_vars) = config.env {
                 for env in env_vars {
                     if let Some(domain_value) = env.strip_prefix("DOMAIN_NAME=") {
-                        let replaced_domain = replace_vars(domain_value, &vars);
+                        let replaced_domain = expand_template(domain_value, &vars);
                         domain_names.extend(
                             replaced_domain
                                 .split(',')
@@ -681,7 +738,7 @@ impl Synchronizer {
             // Extract dev.orbstack.domains label
             if let Some(labels) = config.labels {
                 if let Some(orbstack_domains) = labels.get("dev.orbstack.domains") {
-                    let replaced_domains = replace_vars(orbstack_domains, &vars);
+                    let replaced_domains = expand_template(orbstack_domains, &vars);
                     domain_names.extend(
                         replaced_domains
                             .split(',')
@@ -692,10 +749,16 @@ impl Synchronizer {
             }
         }
 
+        // Docker's API used to expose the default bridge endpoint's address as a
+        // top-level `IPAddress`; that field is gone, so read it from the source.
+        let ip_address = networks
+            .get(DEFAULT_BRIDGE_NETWORK)
+            .map(|bridge| bridge.ip_address.clone());
+
         Some(ContainerInfo {
             id,
             name,
-            ip_address: None,
+            ip_address,
             networks,
             domain_names,
             running,
@@ -808,7 +871,7 @@ impl Synchronizer {
         Ok((started_at, Self::extract_container_info(container)))
     }
 
-    async fn write_hosts_file_immediate(&self) -> Result<()> {
+    async fn write_hosts_file_immediate(&self) -> Result<WriteOutcome> {
         // Snapshot both maps so we don't hold locks during file I/O.
         let active_containers: BTreeMap<String, ContainerInfo> =
             self.active_containers.lock().await.clone();
@@ -827,6 +890,16 @@ impl Synchronizer {
                 let mut skipped = Vec::new();
 
                 for h in hosts {
+                    // Names come from image-controlled env vars and labels. Anything
+                    // that could break out of its hosts line (whitespace, newlines,
+                    // `#`) is dropped outright, not even echoed into a comment.
+                    if !is_hosts_file_safe(&h) {
+                        warn!(
+                            "Ignoring invalid hostname {h:?} from container \"{}\"",
+                            container.name
+                        );
+                        continue;
+                    }
                     // Unresolved variables e.g. {MISSING_VAR} shouldn't be added as hostnames.
                     if h.contains('{') && h.contains('}') {
                         skipped.push(h);
@@ -867,7 +940,10 @@ impl Synchronizer {
             }
         }
 
-        host_entries_with_ip.sort_by(|a, b| a.0.cmp(&b.0));
+        // Numeric order, so 172.17.0.10 follows 172.17.0.9. The sort is stable,
+        // which keeps lines sharing an IP in the order they were generated.
+        host_entries_with_ip
+            .sort_by_cached_key(|(ip, _)| (ip.parse::<std::net::IpAddr>().ok(), ip.clone()));
         let host_entries: Vec<String> = host_entries_with_ip
             .into_iter()
             .map(|(_, line)| line)
@@ -901,7 +977,7 @@ impl Synchronizer {
                 container_count.to_string().bright_white(),
                 hostname_count.to_string().bright_white()
             );
-            return Ok(());
+            return Ok(WriteOutcome::DryRun);
         }
 
         // Write mode: actually update the file
@@ -975,6 +1051,13 @@ impl Synchronizer {
             ));
         }
 
+        // Most events (restarts, duplicate start/stop pairs, replays) change
+        // nothing; leave the system file and its mtime alone then.
+        if new_content == content {
+            debug!("{} already up to date", self.hosts_file.display());
+            return Ok(WriteOutcome::Unchanged);
+        }
+
         write_in_place(&self.hosts_file, &new_content, &content)?;
 
         if container_count == 0 {
@@ -991,7 +1074,7 @@ impl Synchronizer {
             );
         }
 
-        Ok(())
+        Ok(WriteOutcome::Written)
     }
 }
 
@@ -1148,6 +1231,149 @@ mod tests {
         );
     }
 
+    /// Seeds one container on `net` (172.18.0.2) with the given domain names and
+    /// returns the hosts file contents after a write.
+    async fn write_with_domain_names(domain_names: &[&str]) -> String {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
+
+        let mut networks = BTreeMap::new();
+        networks.insert(
+            "net".to_string(),
+            NetworkInfo {
+                ip_address: "172.18.0.2".to_string(),
+                aliases: vec![],
+            },
+        );
+        sync.active_containers.lock().await.insert(
+            "c1".to_string(),
+            ContainerInfo {
+                id: "c1".to_string(),
+                name: "web".to_string(),
+                ip_address: None,
+                networks,
+                domain_names: domain_names.iter().map(ToString::to_string).collect(),
+                running: true,
+            },
+        );
+
+        sync.write_hosts_file_immediate().await.unwrap();
+        fs::read_to_string(&path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_write_hosts_file_rejects_hostname_with_newline() {
+        let content = write_with_domain_names(&["ok.test", "evil.test\n6.6.6.6 github.com"]).await;
+
+        assert!(
+            content.lines().all(|line| !line.contains("github.com")),
+            "a domain name must not be able to inject its own hosts line: {content}"
+        );
+        assert!(
+            content.contains("172.18.0.2 web.net ok.test\n"),
+            "valid names on the same container are still written: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_hosts_file_rejects_hostname_with_whitespace_or_comment() {
+        let content = write_with_domain_names(&["ok.test", "a.test b.test", "c.test#x"]).await;
+
+        assert!(
+            content.contains("172.18.0.2 web.net ok.test\n"),
+            "only the valid name may be written: {content}"
+        );
+        assert!(!content.contains("b.test"), "{content}");
+        assert!(!content.contains("c.test"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn test_write_hosts_file_skips_unchanged_content() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
+        seed_container(&sync, "c1", "web", "172.18.0.2").await;
+
+        assert_eq!(
+            sync.write_hosts_file_immediate().await.unwrap(),
+            WriteOutcome::Written
+        );
+        let first = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            sync.write_hosts_file_immediate().await.unwrap(),
+            WriteOutcome::Unchanged,
+            "nothing changed, so the hosts file must not be rewritten"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn test_write_hosts_file_sorts_ips_numerically() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
+        seed_container(&sync, "c1", "ten", "172.17.0.10").await;
+        seed_container(&sync, "c2", "two", "172.17.0.2").await;
+        seed_container(&sync, "c3", "nine", "172.17.0.9").await;
+
+        sync.write_hosts_file_immediate().await.unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let ips: Vec<&str> = content
+            .lines()
+            .filter(|line| line.starts_with("172."))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        assert_eq!(ips, ["172.17.0.2", "172.17.0.9", "172.17.0.10"]);
+    }
+
+    #[tokio::test]
+    async fn test_consume_events_fails_when_docker_stream_ends() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(
+            docker,
+            temp_file.path().to_path_buf(),
+            ".docker".to_string(),
+            true,
+            100,
+        );
+
+        let result = sync
+            .consume_events(tokio_stream::iter(Vec::<
+                Result<EventMessage, bollard::errors::Error>,
+            >::new()))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a closed event stream means events are being missed; exiting cleanly would hide that"
+        );
+    }
+
+    #[test]
+    fn test_events_options_replays_from_sync_start() {
+        let options = Synchronizer::events_options(Some(1_700_000_000));
+
+        assert_eq!(options.since.as_deref(), Some("1700000000"));
+        let filters = options.filters.expect("events must be filtered");
+        assert_eq!(
+            filters.get("type"),
+            Some(&vec!["container".to_string(), "network".to_string()])
+        );
+    }
+
     #[tokio::test]
     async fn test_write_hosts_file_dry_run_mode() {
         let temp_file = NamedTempFile::new().unwrap();
@@ -1287,6 +1513,62 @@ mod tests {
         assert!(container_info
             .domain_names
             .contains(&"www.example.com".to_string()));
+    }
+
+    fn container_on_networks(networks: &[(&str, &str)]) -> ContainerInspectResponse {
+        ContainerInspectResponse {
+            id: Some("abc123".to_string()),
+            name: Some("/nginx".to_string()),
+            state: Some(bollard::models::ContainerState {
+                running: Some(true),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                networks: Some(
+                    networks
+                        .iter()
+                        .map(|(name, ip)| {
+                            (
+                                (*name).to_string(),
+                                bollard::models::EndpointSettings {
+                                    ip_address: Some((*ip).to_string()),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_extract_container_info_uses_default_bridge_ip_as_global_ip() {
+        let info = Synchronizer::extract_container_info(container_on_networks(&[(
+            "bridge",
+            "172.17.0.2",
+        )]))
+        .expect("container should be extracted");
+
+        assert_eq!(info.ip_address.as_deref(), Some("172.17.0.2"));
+        assert_eq!(
+            info.get_hostnames(".docker").first(),
+            Some(&("172.17.0.2".to_string(), vec!["nginx.docker".to_string()])),
+            "a bridge container gets the documented {{name}}{{tld}} hostname"
+        );
+    }
+
+    #[test]
+    fn test_extract_container_info_has_no_global_ip_off_the_default_bridge() {
+        let info = Synchronizer::extract_container_info(container_on_networks(&[(
+            "myapp_default",
+            "172.18.0.2",
+        )]))
+        .expect("container should be extracted");
+
+        assert_eq!(info.ip_address, None);
     }
 
     #[test]

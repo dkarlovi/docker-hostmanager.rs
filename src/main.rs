@@ -87,6 +87,32 @@ enum Commands {
     Version,
 }
 
+/// Resolves when the process is asked to stop: Ctrl+C, or SIGTERM from
+/// `docker stop`. The handlers are installed before this returns, so a signal
+/// arriving before the future is first polled is not lost.
+#[cfg(unix)]
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use signal::unix::{signal, SignalKind};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    Ok(async {
+        if let Err(e) = signal::ctrl_c().await {
+            tracing::error!("Failed to listen for Ctrl+C: {e}");
+        }
+    })
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -104,8 +130,8 @@ async fn main() -> Result<()> {
         .with_ansi(true)
         .init();
 
-    // Answer health probes before anything else: a probe must not print the
-    // banner, and must not need a Docker connection to report on this instance.
+    // Answer health probes and version queries before anything else: neither
+    // may print the banner, nor need a Docker connection.
     if matches!(args.command, Some(Commands::Health)) {
         let summary = health::probe(
             &args.health_socket,
@@ -115,6 +141,10 @@ async fn main() -> Result<()> {
         .await
         .context("health check failed")?;
         println!("{summary}");
+        return Ok(());
+    }
+    if matches!(args.command, Some(Commands::Version)) {
+        println!("dkarlovi/{PACKAGE_NAME} {VERSION}");
         return Ok(());
     }
 
@@ -147,65 +177,16 @@ async fn main() -> Result<()> {
     // Determine command (default to watch)
     let command = args.command.unwrap_or(Commands::Watch { once: false });
 
-    match command {
+    let (hosts_file, write_enabled, once) = match command {
         // Already handled above, before the Docker connection was made.
-        Commands::Health => return Ok(()),
-        Commands::Version => {
-            println!("dkarlovi/{PACKAGE_NAME} {VERSION}");
-            return Ok(());
-        }
+        Commands::Health | Commands::Version => return Ok(()),
         Commands::Watch { once } => {
             println!(
                 "{} Watch mode - displaying hostname changes only",
                 "ℹ".bright_blue()
             );
             // No reservation line here: watch mode never writes a hosts file.
-            println!(
-                "{} Health socket: {}",
-                "ℹ".bright_blue(),
-                args.health_socket.display().to_string().bright_white()
-            );
-            println!();
-
-            let sync = Synchronizer::new(
-                docker,
-                PathBuf::from("/etc/hosts"), // Unused in watch mode
-                args.tld.clone(),
-                false, // Never write in watch mode
-                args.debounce_ms,
-            );
-            let health_state = sync.health();
-
-            println!(
-                "{}",
-                "Performing initial synchronization...".bright_yellow()
-            );
-            sync.synchronize().await?;
-            println!(
-                "{} {}",
-                "✓".bright_green(),
-                "Initial synchronization complete".bright_white()
-            );
-
-            if once {
-                println!("{}", "Running in once mode, exiting...".bright_yellow());
-                return Ok(());
-            }
-
-            println!();
-            println!("{}", "Listening for Docker events...".bright_yellow());
-            println!("{}", "(Press Ctrl+C to stop)".bright_black());
-
-            tokio::select! {
-                result = sync.listen_events() => {
-                    result?;
-                }
-                () = health::serve(health_state, args.health_socket.clone()) => {}
-                _ = signal::ctrl_c() => {
-                    println!();
-                    println!("{}", "Received shutdown signal, exiting gracefully...".bright_yellow());
-                }
-            }
+            (PathBuf::from("/etc/hosts"), false, once) // Unused in watch mode
         }
         Commands::Sync { hosts_file, once } => {
             if !hosts_file.exists() {
@@ -239,54 +220,83 @@ async fn main() -> Result<()> {
                     reason.bright_white()
                 ),
             }
-            println!(
-                "{} Health socket: {}",
-                "ℹ".bright_blue(),
-                args.health_socket.display().to_string().bright_white()
-            );
+            (hosts_file, true, once)
+        }
+    };
+
+    println!(
+        "{} Health socket: {}",
+        "ℹ".bright_blue(),
+        args.health_socket.display().to_string().bright_white()
+    );
+    println!();
+
+    // Installed before the initial sync, so a `docker stop` during startup is
+    // honoured instead of ignored (as PID 1 there is no default action).
+    let shutdown = shutdown_signal().context("Failed to install signal handlers")?;
+
+    let sync = Synchronizer::new(
+        docker,
+        hosts_file,
+        args.tld,
+        write_enabled,
+        args.debounce_ms,
+    );
+    let health_state = sync.health();
+
+    println!(
+        "{}",
+        "Performing initial synchronization...".bright_yellow()
+    );
+    sync.synchronize().await?;
+    println!(
+        "{} {}",
+        "✓".bright_green(),
+        "Initial synchronization complete".bright_white()
+    );
+
+    if once {
+        println!("{}", "Running in once mode, exiting...".bright_yellow());
+        return Ok(());
+    }
+
+    println!();
+    println!("{}", "Listening for Docker events...".bright_yellow());
+    println!("{}", "(Press Ctrl+C to stop)".bright_black());
+
+    tokio::select! {
+        result = sync.listen_events() => {
+            result?;
+        }
+        () = health::serve(health_state, args.health_socket) => {}
+        () = shutdown => {
             println!();
-
-            let sync = Synchronizer::new(
-                docker,
-                hosts_file.clone(),
-                args.tld.clone(),
-                true, // Always write in sync mode
-                args.debounce_ms,
-            );
-            let health_state = sync.health();
-
-            println!(
-                "{}",
-                "Performing initial synchronization...".bright_yellow()
-            );
-            sync.synchronize().await?;
-            println!(
-                "{} {}",
-                "✓".bright_green(),
-                "Initial synchronization complete".bright_white()
-            );
-
-            if once {
-                println!("{}", "Running in once mode, exiting...".bright_yellow());
-                return Ok(());
-            }
-
-            println!();
-            println!("{}", "Listening for Docker events...".bright_yellow());
-            println!("{}", "(Press Ctrl+C to stop)".bright_black());
-
-            tokio::select! {
-                result = sync.listen_events() => {
-                    result?;
-                }
-                () = health::serve(health_state, args.health_socket.clone()) => {}
-                _ = signal::ctrl_c() => {
-                    println!();
-                    println!("{}", "Received shutdown signal, exiting gracefully...".bright_yellow());
-                }
-            }
+            println!("{}", "Received shutdown signal, exiting gracefully...".bright_yellow());
         }
     }
 
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+#[expect(clippy::expect_used, reason = "tests should fail loudly")]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_shutdown_signal_resolves_on_sigterm() {
+        // `docker stop` sends SIGTERM, and as PID 1 the process gets no default
+        // action for it: without a handler, every stop waits out the kill timeout.
+        let shutdown = shutdown_signal().expect("signal handlers should install");
+
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("kill should run");
+        assert!(status.success(), "kill should deliver SIGTERM");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
+            .await
+            .expect("SIGTERM should trigger shutdown");
+    }
 }
