@@ -190,9 +190,16 @@ pub async fn probe(path: &Path, max_age_secs: u64, timeout: Duration) -> Result<
         .context("timed out reading the health response")?
         .context("failed to read the health response")?;
 
+    assess(&buf, max_age_secs)
+}
+
+/// Judges a health report against the allowed idle time.
+///
+/// Returns a summary when healthy, and an error naming the problem otherwise.
+fn assess(report: &str, max_age_secs: u64) -> Result<String> {
     let mut parsed_age = None;
     let mut parsed_write_ok = None;
-    for field in buf.split_whitespace() {
+    for field in report.split_whitespace() {
         if let Some(v) = field.strip_prefix("age=") {
             parsed_age = v.parse::<u64>().ok();
         } else if let Some(v) = field.strip_prefix("write_ok=") {
@@ -201,7 +208,7 @@ pub async fn probe(path: &Path, max_age_secs: u64, timeout: Duration) -> Result<
     }
 
     let (Some(age), Some(write_ok)) = (parsed_age, parsed_write_ok) else {
-        bail!("unrecognised health response: {buf:?}");
+        bail!("unrecognised health response: {report:?}");
     };
 
     if age > max_age_secs {
@@ -231,11 +238,13 @@ pub async fn probe(_path: &Path, _max_age_secs: u64, _timeout: Duration) -> Resu
 mod tests {
     use super::*;
 
-    fn socket_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hostmanager-health-test-{name}"));
-        let _cleaned = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("health.sock")
+    /// A socket path no other test, or concurrent test run, can share.
+    ///
+    /// The directory is removed when the returned guard is dropped.
+    fn socket_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health.sock");
+        (dir, path)
     }
 
     async fn spawn_server(state: Arc<HealthState>, path: PathBuf) {
@@ -252,7 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_reports_healthy() {
-        let path = socket_path("healthy");
+        let (_dir, path) = socket_path();
         let state = Arc::new(HealthState::new());
         spawn_server(Arc::clone(&state), path.clone()).await;
 
@@ -260,9 +269,32 @@ mod tests {
         assert!(result.is_ok(), "expected healthy, got: {result:?}");
     }
 
+    #[test]
+    fn test_touch_refreshes_activity() {
+        let state = HealthState::new();
+        state
+            .last_activity
+            .store(now_secs().saturating_sub(600), Ordering::Relaxed);
+
+        state.touch();
+
+        assert!(
+            state.age_secs() < 600,
+            "touch must reset the idle age, got {}s",
+            state.age_secs()
+        );
+    }
+
+    #[test]
+    fn test_assess_accepts_age_at_the_limit() {
+        // The limit is the longest idle time still considered healthy.
+        assess("age=90 write_ok=true\n", 90).expect("an age at the limit is still healthy");
+        assess("age=91 write_ok=true\n", 90).expect_err("an age past the limit is stale");
+    }
+
     #[tokio::test]
     async fn test_probe_fails_when_activity_is_stale() {
-        let path = socket_path("stale");
+        let (_dir, path) = socket_path();
         let state = Arc::new(HealthState::new());
         // Backdate the last activity well past the threshold.
         state
@@ -281,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_fails_when_last_write_failed() {
-        let path = socket_path("writefail");
+        let (_dir, path) = socket_path();
         let state = Arc::new(HealthState::new());
         state.set_write_ok(false);
         spawn_server(Arc::clone(&state), path.clone()).await;
@@ -297,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_fails_when_nothing_is_listening() {
-        let path = socket_path("absent");
+        let (_dir, path) = socket_path();
         let err = probe(&path, 90, Duration::from_millis(500))
             .await
             .expect_err("probing a dead instance must fail");

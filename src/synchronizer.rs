@@ -240,23 +240,44 @@ fn expand_template(input: &str, vars: &HashMap<String, String>) -> String {
                 var_name.push(next_c);
                 chars.next();
             }
-            if closed && !var_name.is_empty() {
-                if let Some(val) = vars.get(&var_name) {
-                    result.push_str(val);
-                } else {
-                    result.push('{');
-                    result.push_str(&var_name);
-                    result.push('}');
-                }
+            let value = (closed && !var_name.is_empty())
+                .then(|| vars.get(&var_name))
+                .flatten();
+            if let Some(val) = value {
+                result.push_str(val);
             } else {
+                // Not a known variable: put back exactly what was consumed.
                 result.push('{');
                 result.push_str(&var_name);
+                if closed {
+                    result.push('}');
+                }
             }
         } else {
             result.push(c);
         }
     }
     result
+}
+
+/// The lines that belong to the user: everything except our section markers.
+///
+/// Markers are never the user's. Stray ones (e.g. left by a hand edit) are
+/// dropped rather than preserved, or every write would add a new section.
+fn user_lines<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+    lines
+        .iter()
+        .copied()
+        .filter(|line| !matches!(line.trim(), START_TAG | END_TAG))
+        .collect()
+}
+
+/// The first line of `preserved` that `rendered` no longer contains, if any.
+fn first_dropped_line<'a>(preserved: &[&'a str], rendered: &[String]) -> Option<&'a str> {
+    preserved
+        .iter()
+        .copied()
+        .find(|line| !rendered.iter().any(|kept| kept == line))
 }
 
 /// Abbreviates container `id` the way the Docker CLI does.
@@ -797,8 +818,9 @@ impl Synchronizer {
                         );
                         continue;
                     }
-                    // Unresolved variables e.g. {MISSING_VAR} shouldn't be added as hostnames.
-                    if h.contains('{') && h.contains('}') {
+                    // Unresolved variables e.g. {MISSING_VAR}, or a lone brace from a
+                    // malformed template, shouldn't be added as hostnames.
+                    if h.contains(['{', '}']) {
                         skipped.push(h);
                     } else if claims
                         .get(&h)
@@ -882,55 +904,61 @@ impl Synchronizer {
 
         let lines: Vec<&str> = content.lines().collect();
 
-        // Find the managed section
+        // Find the managed section. It ends at the first end marker *after* its
+        // start; an end marker before it is stray, e.g. from a hand edit.
         let start_idx = lines.iter().position(|line| line.trim() == START_TAG);
-
-        let end_idx = lines.iter().position(|line| line.trim() == END_TAG);
+        let end_idx = start_idx.and_then(|start| {
+            lines
+                .iter()
+                .enumerate()
+                .skip(start)
+                .find(|(_, line)| line.trim() == END_TAG)
+                .map(|(idx, _)| idx)
+        });
 
         let mut new_lines = Vec::new();
         // Every line the user owns, i.e. everything outside our managed section.
         // Checked against the rendered result below so we can never drop one.
         let mut preserved: Vec<&str> = Vec::new();
 
-        match (start_idx, end_idx) {
-            (Some(start), Some(end)) if start < end => {
-                // Managed section exists - replace it
-                if let Some(before_managed) = lines.get(..start) {
-                    preserved.extend(before_managed.iter().copied());
-                    new_lines.extend(before_managed.iter().map(std::string::ToString::to_string));
-                }
-
-                if !host_entries.is_empty() {
-                    // Add our managed section
-                    new_lines.push(START_TAG.to_string());
-                    new_lines.extend(host_entries);
-                    new_lines.push(END_TAG.to_string());
-                }
-                // Note: if host_entries is empty, we don't add the tags (removes empty section)
-
-                // Everything after the end tag, which is itself skipped.
-                if let Some(after_managed) = lines.get(end..).and_then(|rest| rest.get(1..)) {
-                    preserved.extend(after_managed.iter().copied());
-                    new_lines.extend(after_managed.iter().map(std::string::ToString::to_string));
-                }
+        if let (Some(start), Some(end)) = (start_idx, end_idx) {
+            // Managed section exists - replace it
+            if let Some(before_managed) = lines.get(..start) {
+                let before = user_lines(before_managed);
+                new_lines.extend(before.iter().map(ToString::to_string));
+                preserved.extend(before);
             }
-            _ => {
-                // No valid managed section - append to end
-                preserved.extend(lines.iter().copied());
-                new_lines.extend(lines.iter().map(std::string::ToString::to_string));
 
-                if !host_entries.is_empty() {
-                    // Add a blank line before our section if the file doesn't end with one
-                    if let Some(last_line) = new_lines.last() {
-                        if !last_line.is_empty() {
-                            new_lines.push(String::new());
-                        }
+            if !host_entries.is_empty() {
+                // Add our managed section
+                new_lines.push(START_TAG.to_string());
+                new_lines.extend(host_entries);
+                new_lines.push(END_TAG.to_string());
+            }
+            // Note: if host_entries is empty, we don't add the tags (removes empty section)
+
+            // Everything after the end tag, which is itself skipped.
+            if let Some(after_managed) = lines.get(end..).and_then(|rest| rest.get(1..)) {
+                let after = user_lines(after_managed);
+                new_lines.extend(after.iter().map(ToString::to_string));
+                preserved.extend(after);
+            }
+        } else {
+            // No valid managed section - append to end
+            preserved.extend(user_lines(&lines));
+            new_lines.extend(preserved.iter().map(ToString::to_string));
+
+            if !host_entries.is_empty() {
+                // Add a blank line before our section if the file doesn't end with one
+                if let Some(last_line) = new_lines.last() {
+                    if !last_line.is_empty() {
+                        new_lines.push(String::new());
                     }
-
-                    new_lines.push(START_TAG.to_string());
-                    new_lines.extend(host_entries);
-                    new_lines.push(END_TAG.to_string());
                 }
+
+                new_lines.push(START_TAG.to_string());
+                new_lines.extend(host_entries);
+                new_lines.push(END_TAG.to_string());
             }
         }
 
@@ -938,10 +966,7 @@ impl Synchronizer {
 
         // Last line of defence before touching the file: whatever happens to the
         // managed section, not one line the user wrote may go missing.
-        if let Some(dropped) = preserved
-            .iter()
-            .find(|line| !new_lines.iter().any(|kept| kept == *line))
-        {
+        if let Some(dropped) = first_dropped_line(&preserved, &new_lines) {
             return Err(anyhow::anyhow!(
                 "refusing to write {}: it would drop the existing line {dropped:?}",
                 self.hosts_file.display()
@@ -1398,6 +1423,15 @@ mod tests {
         network: &str,
         ip: &str,
     ) -> ContainerInspectResponse {
+        running_container_on(id, name, &[(network, ip)])
+    }
+
+    /// A running container `name` attached to each `(network, ip)` pair.
+    fn running_container_on(
+        id: &str,
+        name: &str,
+        networks: &[(&str, &str)],
+    ) -> ContainerInspectResponse {
         ContainerInspectResponse {
             id: Some(id.to_string()),
             name: Some(format!("/{name}")),
@@ -1407,14 +1441,36 @@ mod tests {
                 ..Default::default()
             }),
             network_settings: Some(bollard::models::NetworkSettings {
-                networks: Some(HashMap::from([(
-                    network.to_string(),
-                    bollard::models::EndpointSettings {
-                        ip_address: Some(ip.to_string()),
-                        ..Default::default()
-                    },
-                )])),
+                networks: Some(
+                    networks
+                        .iter()
+                        .map(|(network, ip)| {
+                            (
+                                (*network).to_string(),
+                                bollard::models::EndpointSettings {
+                                    ip_address: Some((*ip).to_string()),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .collect(),
+                ),
                 ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn network_event(action: &str, container_id: &str, network: &str) -> EventMessage {
+        EventMessage {
+            typ: Some(EventMessageTypeEnum::NETWORK),
+            action: Some(action.to_string()),
+            actor: Some(EventActor {
+                id: Some(format!("{network}-id")),
+                attributes: Some(HashMap::from([
+                    ("container".to_string(), container_id.to_string()),
+                    ("name".to_string(), network.to_string()),
+                ])),
             }),
             ..Default::default()
         }
@@ -1513,6 +1569,176 @@ mod tests {
 
         let content = fs::read_to_string(hosts.path()).unwrap();
         assert!(!content.contains("web.app"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn test_network_connect_event_adds_hosts_entry() {
+        let hosts = hosts_file_with_localhost();
+        let (sync, docker) =
+            Synchronizer::new_fake(hosts.path().to_path_buf(), ".docker".to_string(), true, 10);
+        docker.start(running_container("c1", "web", "app", "172.18.0.2"));
+        sync.synchronize().await.unwrap();
+
+        docker.start(running_container_on(
+            "c1",
+            "web",
+            &[("app", "172.18.0.2"), ("extra", "172.19.0.2")],
+        ));
+        docker.emit(network_event("connect", "c1", "extra"));
+        listen_briefly(&sync).await;
+
+        let content = fs::read_to_string(hosts.path()).unwrap();
+        assert!(content.contains("172.19.0.2 web.extra\n"), "{content}");
+        assert!(content.contains("172.18.0.2 web.app\n"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn test_network_disconnect_event_removes_only_that_network() {
+        let hosts = hosts_file_with_localhost();
+        let (sync, docker) =
+            Synchronizer::new_fake(hosts.path().to_path_buf(), ".docker".to_string(), true, 10);
+        docker.start(running_container_on(
+            "c1",
+            "web",
+            &[("app", "172.18.0.2"), ("extra", "172.19.0.2")],
+        ));
+        sync.synchronize().await.unwrap();
+
+        docker.start(running_container("c1", "web", "app", "172.18.0.2"));
+        docker.emit(network_event("disconnect", "c1", "extra"));
+        listen_briefly(&sync).await;
+
+        let content = fs::read_to_string(hosts.path()).unwrap();
+        assert!(!content.contains("web.extra"), "{content}");
+        assert!(
+            content.contains("172.18.0.2 web.app\n"),
+            "the container is still on its other network: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_reflects_the_synchronizers_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-hosts-file");
+        let (sync, _docker) = Synchronizer::new_fake(missing, ".docker".to_string(), true, 10);
+
+        sync.synchronize().await.unwrap();
+
+        assert!(
+            !sync.health().write_ok(),
+            "the health socket must see the synchronizer's failed write"
+        );
+    }
+
+    #[test]
+    fn test_first_dropped_line_finds_missing_user_line() {
+        let rendered = vec!["127.0.0.1 localhost".to_string()];
+
+        assert_eq!(
+            first_dropped_line(&["127.0.0.1 localhost", "10.0.0.1 nas"], &rendered),
+            Some("10.0.0.1 nas")
+        );
+        assert_eq!(
+            first_dropped_line(&["127.0.0.1 localhost"], &rendered),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_hosts_file_with_end_tag_before_start_tag_is_stable() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+        let original = format!("127.0.0.1 localhost\n{END_TAG}\n10.0.0.1 nas\n{START_TAG}\n");
+        fs::write(&path, &original).unwrap();
+
+        let docker = Docker::connect_with_socket_defaults().unwrap();
+        let sync = Synchronizer::new(docker, path.clone(), ".docker".to_string(), true, 100);
+        seed_container(&sync, "c1", "web", "172.17.0.2").await;
+
+        sync.write_hosts_file_immediate().await.unwrap();
+        let first = fs::read_to_string(&path).unwrap();
+        assert!(first.contains("127.0.0.1 localhost\n"), "{first}");
+        assert!(first.contains("10.0.0.1 nas\n"), "{first}");
+        assert!(first.contains("172.17.0.2 web.docker\n"), "{first}");
+        assert_eq!(
+            first.matches(START_TAG).count(),
+            1,
+            "stray markers must not survive next to the real section: {first}"
+        );
+
+        assert_eq!(
+            sync.write_hosts_file_immediate().await.unwrap(),
+            WriteOutcome::Unchanged,
+            "a misordered file must not grow a new section on every write"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_hosts_file_skips_name_with_lone_brace() {
+        let content = write_with_domain_names(&["ok.test", "half{open.test"]).await;
+
+        let hostnames = content
+            .lines()
+            .find(|line| line.starts_with("172.18.0.2 "))
+            .and_then(|line| line.split('#').next())
+            .unwrap_or_default();
+        assert_eq!(hostnames.trim(), "172.18.0.2 web.net ok.test", "{content}");
+    }
+
+    #[test]
+    fn test_expand_template_keeps_empty_braces() {
+        assert_eq!(expand_template("a{}b", &HashMap::new()), "a{}b");
+    }
+
+    #[test]
+    fn test_expand_template_leaves_unclosed_variable_alone() {
+        let vars = HashMap::from([("FOO".to_string(), "x".to_string())]);
+
+        assert_eq!(expand_template("a{FOO", &vars), "a{FOO");
+    }
+
+    #[test]
+    fn test_network_event_targets_requires_container_id() {
+        let event = network_event("connect", "", "extra");
+
+        assert_eq!(network_event_targets(event.actor.as_ref()), None);
+    }
+
+    #[test]
+    fn test_extract_container_info_skips_stopped_container_without_ports() {
+        let mut container = running_container("c1", "web", "app", "172.18.0.2");
+        container.state = Some(bollard::models::ContainerState {
+            running: Some(false),
+            ..Default::default()
+        });
+        if let Some(settings) = container.network_settings.as_mut() {
+            settings.ports = Some(HashMap::new());
+        }
+
+        assert!(extract_container_info(container).is_none());
+    }
+
+    #[test]
+    fn test_extract_container_info_keeps_stopped_container_with_ports() {
+        let mut container = running_container("c1", "web", "app", "172.18.0.2");
+        container.state = Some(bollard::models::ContainerState {
+            running: Some(false),
+            ..Default::default()
+        });
+        if let Some(settings) = container.network_settings.as_mut() {
+            settings.ports = Some(HashMap::from([("80/tcp".to_string(), None)]));
+        }
+
+        assert!(extract_container_info(container).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_reserve_space_allocates_the_requested_bytes() {
+        let file = NamedTempFile::new().unwrap();
+
+        assert!(reserve_space(file.as_file(), 4096).unwrap());
+        assert_eq!(file.as_file().metadata().unwrap().len(), 4096);
     }
 
     #[tokio::test]
