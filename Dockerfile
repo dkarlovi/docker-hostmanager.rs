@@ -1,4 +1,4 @@
-FROM rust:slim AS chef
+FROM --platform=$BUILDPLATFORM rust:slim AS chef
 WORKDIR /usr/src/app
 COPY rust-toolchain.toml ./
 RUN rustup show && \
@@ -14,7 +14,6 @@ COPY src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
-ARG VERSION=dev
 ARG TARGETARCH
 RUN case "$TARGETARCH" in \
         "amd64") echo "x86_64-unknown-linux-musl" > /tmp/rust-target ;; \
@@ -28,6 +27,10 @@ RUN cargo chef cook --no-build --recipe-path recipe.json && \
     cargo chef cook --frozen --release --target $(cat /tmp/rust-target) --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
+# Declared this late on purpose: a build arg is part of the cache key of every
+# RUN after it, and VERSION changes on each commit, so declaring it earlier
+# would rebuild all dependencies every time.
+ARG VERSION=dev
 ENV GIT_VERSION=${VERSION}
 RUN cargo auditable build --frozen --release --target $(cat /tmp/rust-target) && \
     mkdir -p /output && \
