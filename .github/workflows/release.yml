@@ -48,6 +48,7 @@ jobs:
       - name: Install Rust
         shell: bash
         run: |
+          rustup toolchain install
           rustup show
           rustup target add "${{ matrix.target }}"
 
