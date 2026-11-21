@@ -38,7 +38,7 @@ docker-build-arm64: ## Build ARM64 Docker image
 docker-run: docker-build ## Run in Docker container
 	docker run --rm \
 		-v /var/run/docker.sock:/var/run/docker.sock \
-		-v /etc/hosts:/etc/hosts \
+		-v /etc/hosts:/hosts \
 		dkarlovi/docker-hostmanager
 
 check: test clippy ## Run tests and linting

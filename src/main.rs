@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use bollard::Docker;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -161,6 +161,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Cover Docker connection and initial synchronization as well as the event
+    // loop: a slow daemon must not make startup ignore a shutdown request.
+    let shutdown = shutdown_signal().context("Failed to install signal handlers")?;
+    tokio::select! {
+        result = run(args) => result,
+        () = shutdown => {
+            println!();
+            println!("{}", "Received shutdown signal, exiting gracefully...".bright_yellow());
+            Ok(())
+        }
+    }
+}
+
+async fn run(args: Args) -> Result<()> {
     println!("{}", "Docker Host Manager".bright_cyan().bold());
     println!("{}", "===================".bright_cyan());
     println!("{} {}", "Version:".bright_black(), VERSION.bright_white());
@@ -248,10 +262,6 @@ async fn main() -> Result<()> {
     );
     println!();
 
-    // Installed before the initial sync, so a `docker stop` during startup is
-    // honoured instead of ignored (as PID 1 there is no default action).
-    let shutdown = shutdown_signal().context("Failed to install signal handlers")?;
-
     let sync = Synchronizer::new(
         docker,
         hosts_file,
@@ -266,13 +276,19 @@ async fn main() -> Result<()> {
         "Performing initial synchronization...".bright_yellow()
     );
     sync.synchronize().await?;
-    println!(
-        "{} {}",
-        "✓".bright_green(),
-        "Initial synchronization complete".bright_white()
-    );
+    if health_state.write_ok() {
+        println!(
+            "{} {}",
+            "✓".bright_green(),
+            "Initial synchronization complete".bright_white()
+        );
+    }
 
     if once {
+        ensure!(
+            health_state.write_ok(),
+            "Initial synchronization failed to write the hosts file"
+        );
         println!("{}", "Running in once mode, exiting...".bright_yellow());
         return Ok(());
     }
@@ -286,10 +302,6 @@ async fn main() -> Result<()> {
             result?;
         }
         () = health::serve(health_state, args.health_socket) => {}
-        () = shutdown => {
-            println!();
-            println!("{}", "Received shutdown signal, exiting gracefully...".bright_yellow());
-        }
     }
 
     Ok(())

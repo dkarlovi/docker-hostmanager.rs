@@ -599,7 +599,9 @@ impl Synchronizer {
             }
             (
                 Some(EventMessageTypeEnum::CONTAINER),
-                "die" | "stop" | "kill" | "pause" | "destroy",
+                // `kill` means a signal was sent, including nonterminating
+                // signals such as SIGHUP. Actual exits produce a `die` event.
+                "die" | "stop" | "pause" | "destroy",
             ) => {
                 self.handle_container_down(actor_id).await;
             }
@@ -748,15 +750,23 @@ impl Synchronizer {
     /// `Some(name)`, only hostnames bound to that specific network attachment are
     /// released — claims tied to the container's other networks are preserved.
     /// When `None`, all of the container's hostnames are released (used for full
-    /// container teardown: die/stop/kill/pause/destroy).
+    /// container teardown: die/stop/pause/destroy).
     async fn release_hostnames(
         &self,
         container_id: &str,
         container: &ContainerInfo,
         only_network: Option<&str>,
     ) {
-        let only_network_ip =
-            only_network.and_then(|net| container.networks.get(net).map(|n| n.ip_address.as_str()));
+        let only_network_ip = if let Some(net) = only_network {
+            // Replayed disconnects may refer to an attachment already absent
+            // from the initial snapshot. They must not release other networks.
+            let Some(network) = container.networks.get(net) else {
+                return;
+            };
+            Some(network.ip_address.as_str())
+        } else {
+            None
+        };
 
         // When filtering to a specific network, keep only the entry whose IP
         // matches that network's IP. The global-ip entry (used when the container
@@ -1580,6 +1590,56 @@ mod tests {
 
         let content = fs::read_to_string(hosts.path()).unwrap();
         assert!(!content.contains("web.app"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn test_nonterminating_signal_keeps_container_hosts_entry() {
+        let hosts = hosts_file_with_localhost();
+        let (sync, docker) =
+            Synchronizer::new_fake(hosts.path().to_path_buf(), ".docker".to_string(), true, 10);
+        docker.start(running_container("c1", "web", "app", "172.18.0.2"));
+        sync.synchronize().await.unwrap();
+
+        let mut event = container_event("kill", "c1");
+        event.actor.as_mut().unwrap().attributes =
+            Some(HashMap::from([("signal".to_string(), "1".to_string())]));
+        sync.handle_event(event).await.unwrap();
+        sync.write_hosts_file_immediate().await.unwrap();
+
+        let content = fs::read_to_string(hosts.path()).unwrap();
+        assert!(
+            content.contains("172.18.0.2 web.app\n"),
+            "SIGHUP did not stop the container: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replayed_disconnect_keeps_remaining_network_claims() {
+        let hosts = hosts_file_with_localhost();
+        let (sync, docker) =
+            Synchronizer::new_fake(hosts.path().to_path_buf(), ".docker".to_string(), true, 10);
+        // The initial snapshot already reflects the disconnect from `old`.
+        docker.start(running_container("c1", "web", "app", "172.18.0.2"));
+        sync.synchronize().await.unwrap();
+
+        sync.handle_event(network_event("disconnect", "c1", "old"))
+            .await
+            .unwrap();
+        docker.start(running_container("c2", "web", "app", "172.18.0.3"));
+        sync.handle_event(container_event("start", "c2"))
+            .await
+            .unwrap();
+        sync.write_hosts_file_immediate().await.unwrap();
+
+        let content = fs::read_to_string(hosts.path()).unwrap();
+        assert!(
+            content.lines().any(|line| line == "172.18.0.2 web.app"),
+            "the original container must retain ownership: {content}"
+        );
+        assert!(
+            !content.lines().any(|line| line.starts_with("172.18.0.3 ")),
+            "replay must not let another container steal the hostname: {content}"
+        );
     }
 
     #[tokio::test]
