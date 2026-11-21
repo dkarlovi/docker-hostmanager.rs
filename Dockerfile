@@ -1,7 +1,8 @@
 FROM --platform=$BUILDPLATFORM rust:slim AS chef
 WORKDIR /usr/src/app
 COPY rust-toolchain.toml ./
-RUN rustup show && \
+RUN rustup toolchain install && \
+    rustup show && \
     rustup target add x86_64-unknown-linux-musl && \
     rustup target add aarch64-unknown-linux-musl && \
     apt-get update && apt-get install -y musl-tools gcc-aarch64-linux-gnu && \

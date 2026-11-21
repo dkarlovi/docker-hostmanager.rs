@@ -18,7 +18,9 @@ jobs:
         with:
           fetch-depth: 0 # Fetch all history and tags for version info
       - name: Install pinned Rust toolchain
-        run: rustup show
+        run: |
+          rustup toolchain install
+          rustup show
       - uses: Swatinem/rust-cache@v2
       - name: Fetch locked dependencies
         run: cargo fetch --locked
@@ -33,7 +35,9 @@ jobs:
         with:
           fetch-depth: 0 # Fetch all history and tags for version info
       - name: Install pinned Rust toolchain
-        run: rustup show
+        run: |
+          rustup toolchain install
+          rustup show
       - uses: Swatinem/rust-cache@v2
       - name: Fetch locked dependencies
         run: cargo fetch --locked
@@ -51,7 +55,9 @@ jobs:
         with:
           fetch-depth: 0 # Fetch all history and tags for version info
       - name: Install pinned Rust toolchain
-        run: rustup show
+        run: |
+          rustup toolchain install
+          rustup show
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -78,7 +84,9 @@ jobs:
         with:
           fetch-depth: 0 # Fetch all history and tags for version info
       - name: Install pinned Rust toolchain
-        run: rustup show
+        run: |
+          rustup toolchain install
+          rustup show
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -90,7 +98,9 @@ jobs:
         with:
           fetch-depth: 0 # Fetch all history and tags for version info
       - name: Install pinned Rust toolchain
-        run: rustup show
+        run: |
+          rustup toolchain install
+          rustup show
       - uses: Swatinem/rust-cache@v2
       - name: Fetch locked dependencies
         run: cargo fetch --locked
